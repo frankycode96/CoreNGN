@@ -22,7 +22,7 @@ def test_sqlite_wal_and_schema_initialization(tmp_path: Path) -> None:
     assert db_file.exists()
     assert meta["journal_mode"] == "WAL"
     assert meta["fts5_enabled"] is True
-    assert meta["schema_version"] == 1
+    assert meta["schema_version"] == 2
 
     stats = engine.inspect_stats()
     assert stats["declarative_facts_count"] == 0

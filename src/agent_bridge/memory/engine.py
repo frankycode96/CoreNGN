@@ -1,18 +1,21 @@
-"""Unified Persistence Layer (LocalMemoryEngine).
+"""Unified Persistence Layer (`LocalMemoryEngine`).
 
 Implements the Zero-Container Local-First persistence engine on a single SQLite
 file in WAL mode with:
-1. Working Memory: LangGraph SqliteSaver atomic checkpoints
-2. Declarative Memory: `declarative_facts` with deterministic UPSERT on (category, key)
-3. Semantic & Episodic Memory: `episodic_artifacts` indexed via SQLite FTS5 (BM25)
-   and CPU-embedded vector columns (`sqlite-vec` + SQLite float32 cosine UDF).
+1. Working Memory: LangGraph SqliteSaver atomic checkpoints.
+2. Declarative Memory: `declarative_facts` scoped by `(repo_identifier, git_branch, category, key)`
+   with deterministic UPSERT and immutability pinning (`pinned`).
+3. Semantic & Episodic Memory: `episodic_artifacts` scoped by `(repo_identifier, git_branch)`
+   and indexed via SQLite FTS5 (BM25) and CPU-embedded vector columns (`sqlite-vec` + SQLite float32 cosine UDF).
 """
 
 from __future__ import annotations
 
 import logging
+import platform
 import sqlite3
 import struct
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,40 +24,53 @@ from typing import Iterator
 import numpy as np
 
 from agent_bridge.config import BridgeConfig
+from agent_bridge.memory.git_context import GitContextInfo, resolve_git_context
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-CORE_DDL = """
+CORE_DDL_V2 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
 );
 
--- Layer 2: Declarative Memory (Deterministic Upsert, Latest-is-Truth)
+-- Layer 2: Declarative Memory (Git-Branch Scoped, Deterministic Upsert, Pinning Support)
 CREATE TABLE IF NOT EXISTS declarative_facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_identifier TEXT NOT NULL DEFAULT 'workspace:default',
+    git_branch TEXT NOT NULL DEFAULT 'default',
     category TEXT NOT NULL,
     key TEXT NOT NULL,
     value_json TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
-    CONSTRAINT uq_declarative_category_key UNIQUE (category, key)
+    CONSTRAINT uq_declarative_repo_branch_cat_key UNIQUE (repo_identifier, git_branch, category, key)
 );
+
+CREATE INDEX IF NOT EXISTS idx_declarative_repo_branch_cat_key
+    ON declarative_facts (repo_identifier, git_branch, category, key);
 
 CREATE INDEX IF NOT EXISTS idx_declarative_category_updated
     ON declarative_facts (category, updated_at DESC);
 
--- Layer 3 & 4: Semantic & Episodic Memory (Validated Task/Artifact pairs only)
+-- Layer 3 & 4: Semantic & Episodic Memory (Git-Branch Scoped, Validated Task/Artifact pairs only)
 CREATE TABLE IF NOT EXISTS episodic_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_identifier TEXT NOT NULL DEFAULT 'workspace:default',
+    git_branch TEXT NOT NULL DEFAULT 'default',
     task TEXT NOT NULL,
     final_artifact TEXT NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
     quality_score REAL NOT NULL DEFAULT 1.0,
+    pinned INTEGER NOT NULL DEFAULT 0,
     embedding BLOB,
     created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_episodic_repo_branch_created
+    ON episodic_artifacts (repo_identifier, git_branch, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_episodic_created_at
     ON episodic_artifacts (created_at DESC);
@@ -119,16 +135,72 @@ def _sqlite_cosine_similarity(blob_a: bytes | None, blob_b: bytes | None) -> flo
     return max(-1.0, min(1.0, sim))
 
 
+def detect_sqlite_vec_platform_guidance() -> str:
+    """Return cross-platform remediation guidance if `sqlite-vec` C extension fails to load."""
+    os_name = sys.platform
+    arch = platform.machine().lower()
+    if os_name == "darwin":
+        return (
+            f"macOS ({arch}) detected: Ensure Python is built with `--enable-loadable-sqlite-extensions` "
+            "(e.g., Homebrew `brew install python@3.11`) and `pip install sqlite-vec` provides `vec0.dylib`."
+        )
+    if os_name.startswith("linux"):
+        return (
+            f"Linux ({arch}) detected: Ensure glibc >= 2.28 and `libsqlite3-0` with loadable extension support "
+            "are installed alongside `pip install sqlite-vec` (`vec0.so`)."
+        )
+    if os_name in {"win32", "cygwin"}:
+        return (
+            f"Windows ({arch}) detected: Ensure official python.org CPython >= 3.10 with `sqlite3.dll` "
+            "extension loading enabled and `pip install sqlite-vec` (`vec0.dll`)."
+        )
+    return f"Platform {os_name}/{arch}: Verify `sqlite-vec` C shared library compatibility."
+
+
 class LocalMemoryEngine:
     """Unified embedded SQLite engine managing Working, Declarative, and Episodic memory layers."""
 
-    def __init__(self, config: BridgeConfig | None = None, db_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        config: BridgeConfig | None = None,
+        db_path: Path | str | None = None,
+        git_branch: str | None = None,
+        repo_identifier: str | None = None,
+    ) -> None:
         self.config = config or BridgeConfig.from_env()
         if db_path is not None:
             self.config.db_path = Path(db_path).expanduser().resolve()
+        if git_branch is not None:
+            self.config.git_branch_override = git_branch
+        if repo_identifier is not None:
+            self.config.repo_id_override = repo_identifier
+
         self.db_path: Path = self.config.db_path
         self.sqlite_vec_enabled: bool = False
+        self.sqlite_vec_diagnostic: str = "uninitialized"
+        self.git_context: GitContextInfo = resolve_git_context(
+            workspace_path=self.config.repo_root,
+            branch_override=self.config.git_branch_override,
+            repo_id_override=self.config.repo_id_override,
+        )
         self._ensure_directory()
+
+    def refresh_git_context(
+        self,
+        branch_override: str | None = None,
+        repo_id_override: str | None = None,
+    ) -> GitContextInfo:
+        """Re-evaluate the active Git context (e.g., after `git checkout` or branch switch)."""
+        if branch_override is not None:
+            self.config.git_branch_override = branch_override
+        if repo_id_override is not None:
+            self.config.repo_id_override = repo_id_override
+        self.git_context = resolve_git_context(
+            workspace_path=self.config.repo_root,
+            branch_override=self.config.git_branch_override,
+            repo_id_override=self.config.repo_id_override,
+        )
+        return self.git_context
 
     def _ensure_directory(self) -> None:
         """Ensure parent directory for the SQLite database exists."""
@@ -136,7 +208,7 @@ class LocalMemoryEngine:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _configure_connection(self, conn: sqlite3.Connection) -> None:
-        """Apply WAL pragmas, register vector UDFs, and optionally load sqlite-vec."""
+        """Apply WAL pragmas, register vector UDFs, and load cross-platform sqlite-vec C extension."""
         conn.row_factory = sqlite3.Row
         sqlite_cfg = self.config.sqlite
 
@@ -146,20 +218,32 @@ class LocalMemoryEngine:
         conn.execute(f"PRAGMA cache_size = {int(sqlite_cfg.cache_size_kb)};")
         conn.execute(f"PRAGMA foreign_keys = {'ON' if sqlite_cfg.foreign_keys else 'OFF'};")
 
-        # Register in-process CPU vector similarity function for guaranteed portable SQL vector queries
+        # Register in-process CPU vector similarity function for guaranteed zero-VRAM SQL vector queries
         conn.create_function("vec_cosine_similarity", 2, _sqlite_cosine_similarity, deterministic=True)
 
-        # Attempt to load native C sqlite-vec extension if supported by the Python build
-        if hasattr(conn, "enable_load_extension"):
-            try:
-                import sqlite_vec  # type: ignore[import-untyped]
+        # Cross-platform loading of native C sqlite-vec extension
+        if not hasattr(conn, "enable_load_extension"):
+            self.sqlite_vec_enabled = False
+            self.sqlite_vec_diagnostic = (
+                "Python sqlite3 built without enable_load_extension; using CPU float32 UDF fallback. "
+                + detect_sqlite_vec_platform_guidance()
+            )
+            return
 
-                conn.enable_load_extension(True)
-                sqlite_vec.load(conn)
-                conn.enable_load_extension(False)
-                self.sqlite_vec_enabled = True
-            except Exception as exc:  # pragma: no cover - graceful fallback when load_extension disabled
-                logger.debug("sqlite-vec extension not loaded (using native float32 UDF fallback): %s", exc)
+        try:
+            import sqlite_vec  # type: ignore[import-untyped]
+
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            self.sqlite_vec_enabled = True
+            self.sqlite_vec_diagnostic = f"loaded ({sys.platform}/{platform.machine().lower()})"
+        except Exception as exc:  # pragma: no cover - graceful fallback when load_extension disabled
+            self.sqlite_vec_enabled = False
+            self.sqlite_vec_diagnostic = (
+                f"fallback_udf ({exc}). {detect_sqlite_vec_platform_guidance()}"
+            )
+            logger.debug("sqlite-vec extension not loaded: %s", self.sqlite_vec_diagnostic)
 
     def connect(self) -> sqlite3.Connection:
         """Create and configure a new SQLite connection."""
@@ -180,10 +264,54 @@ class LocalMemoryEngine:
         finally:
             conn.close()
 
+    def _migrate_v1_to_v2_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Idempotently migrate v1 schemas to v2 (`repo_identifier`, `git_branch`, `pinned`)."""
+        decl_info = conn.execute("PRAGMA table_info(declarative_facts);").fetchall()
+        if decl_info:
+            col_names = {str(r["name"]) for r in decl_info}
+            if "git_branch" not in col_names or "repo_identifier" not in col_names or "pinned" not in col_names:
+                default_repo = self.git_context.repo_identifier
+                default_branch = self.git_context.git_branch
+                conn.executescript(
+                    f"""
+                    ALTER TABLE declarative_facts RENAME TO _declarative_facts_v1;
+                    CREATE TABLE declarative_facts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        repo_identifier TEXT NOT NULL DEFAULT 'workspace:default',
+                        git_branch TEXT NOT NULL DEFAULT 'default',
+                        category TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value_json TEXT NOT NULL,
+                        pinned INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        CONSTRAINT uq_declarative_repo_branch_cat_key UNIQUE (repo_identifier, git_branch, category, key)
+                    );
+                    INSERT INTO declarative_facts (id, repo_identifier, git_branch, category, key, value_json, pinned, updated_at)
+                    SELECT id, {default_repo!r}, {default_branch!r}, category, key, value_json, 0, updated_at
+                    FROM _declarative_facts_v1;
+                    DROP TABLE _declarative_facts_v1;
+                    """
+                )
+
+        ep_info = conn.execute("PRAGMA table_info(episodic_artifacts);").fetchall()
+        if ep_info:
+            ep_cols = {str(r["name"]) for r in ep_info}
+            if "repo_identifier" not in ep_cols:
+                conn.execute(
+                    f"ALTER TABLE episodic_artifacts ADD COLUMN repo_identifier TEXT NOT NULL DEFAULT {self.git_context.repo_identifier!r};"
+                )
+            if "git_branch" not in ep_cols:
+                conn.execute(
+                    f"ALTER TABLE episodic_artifacts ADD COLUMN git_branch TEXT NOT NULL DEFAULT {self.git_context.git_branch!r};"
+                )
+            if "pinned" not in ep_cols:
+                conn.execute("ALTER TABLE episodic_artifacts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")
+
     def initialize(self) -> dict[str, object]:
-        """Initialize database schemas, FTS5 virtual tables, and sqlite-vec tables if available."""
+        """Initialize or migrate database schemas, FTS5 virtual tables, and sqlite-vec tables."""
         with self.connection() as conn:
-            conn.executescript(CORE_DDL)
+            self._migrate_v1_to_v2_if_needed(conn)
+            conn.executescript(CORE_DDL_V2)
 
             if self.sqlite_vec_enabled:
                 dim = int(self.config.sqlite.vector_dim)
@@ -209,16 +337,15 @@ class LocalMemoryEngine:
             "schema_version": SCHEMA_VERSION,
             "journal_mode": str(journal_mode).upper(),
             "sqlite_vec_enabled": self.sqlite_vec_enabled,
+            "sqlite_vec_diagnostic": self.sqlite_vec_diagnostic,
             "fts5_enabled": True,
+            "repo_identifier": self.git_context.repo_identifier,
+            "git_branch": self.git_context.git_branch,
         }
 
     @contextmanager
     def langgraph_checkpointer(self) -> Iterator[object]:
-        """Yield a Working Memory checkpointer backed by the unified SQLite database.
-
-        Uses LangGraph's official `SqliteSaver` when installed, or falls back to
-        `MemorySaver` only if `langgraph-checkpoint-sqlite` is unavailable.
-        """
+        """Yield a Working Memory checkpointer backed by the unified SQLite database."""
         try:
             from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore[import-untyped]
 
@@ -236,11 +363,42 @@ class LocalMemoryEngine:
             logger.warning("langgraph-checkpoint-sqlite not installed; falling back to in-memory saver")
             yield MemorySaver()
 
+    def list_working_checkpoints(self, limit: int = 25) -> list[dict[str, object]]:
+        """List recent LangGraph Working Memory checkpoints stored in SQLite."""
+        with self.connection() as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='checkpoints';"
+            ).fetchone()
+            if not table_exists:
+                return []
+            rows = conn.execute(
+                """
+                SELECT thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id
+                FROM checkpoints
+                ORDER BY rowid DESC
+                LIMIT ?;
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [
+            {
+                "thread_id": str(r["thread_id"]),
+                "checkpoint_ns": str(r["checkpoint_ns"] or ""),
+                "checkpoint_id": str(r["checkpoint_id"]),
+                "parent_checkpoint_id": str(r["parent_checkpoint_id"] or ""),
+            }
+            for r in rows
+        ]
+
     def inspect_stats(self) -> dict[str, object]:
         """Return operational telemetry for the unified SQLite memory engine."""
         with self.connection() as conn:
             decl_count = conn.execute("SELECT COUNT(*) FROM declarative_facts;").fetchone()[0]
+            pinned_decl = conn.execute("SELECT COUNT(*) FROM declarative_facts WHERE pinned = 1;").fetchone()[0]
             ep_count = conn.execute("SELECT COUNT(*) FROM episodic_artifacts;").fetchone()[0]
+            branch_rows = conn.execute(
+                "SELECT DISTINCT git_branch FROM declarative_facts UNION SELECT DISTINCT git_branch FROM episodic_artifacts;"
+            ).fetchall()
             journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
 
         size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
@@ -249,6 +407,11 @@ class LocalMemoryEngine:
             "size_bytes": size_bytes,
             "journal_mode": str(journal_mode).upper(),
             "declarative_facts_count": int(decl_count),
+            "pinned_facts_count": int(pinned_decl),
             "episodic_artifacts_count": int(ep_count),
             "sqlite_vec_enabled": self.sqlite_vec_enabled,
+            "sqlite_vec_diagnostic": self.sqlite_vec_diagnostic,
+            "repo_identifier": self.git_context.repo_identifier,
+            "active_git_branch": self.git_context.git_branch,
+            "stored_branches": sorted(str(r[0]) for r in branch_rows if r[0]),
         }

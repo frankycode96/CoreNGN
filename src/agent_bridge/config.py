@@ -1,7 +1,8 @@
 """Configuration management for Hybrid Agent Bridge.
 
-Centralizes filesystem paths, SQLite WAL tuning parameters, System-1 (Jev/Local)
-decision thresholds, and System-2 (Ollama / llama.cpp / vLLM) endpoints.
+Centralizes filesystem paths, Git branch scoping overrides, SQLite WAL tuning
+parameters, System-1 (Jev/Local) decision thresholds, and System-2
+(Ollama / llama.cpp / vLLM) endpoints.
 """
 
 from __future__ import annotations
@@ -132,7 +133,15 @@ class BridgeConfig(BaseModel):
     )
     repo_root: Path = Field(
         default_factory=lambda: Path(os.environ.get("AGENT_BRIDGE_REPO_ROOT", os.getcwd())).resolve(),
-        description="Repository root path for Repo Truth Hierarchy enforcement",
+        description="Repository root path for Repo Truth Hierarchy and Git scoping",
+    )
+    git_branch_override: str | None = Field(
+        default_factory=lambda: os.environ.get("AGENT_BRIDGE_GIT_BRANCH"),
+        description="Optional explicit Git branch override for memory scoping",
+    )
+    repo_id_override: str | None = Field(
+        default_factory=lambda: os.environ.get("AGENT_BRIDGE_REPO_ID"),
+        description="Optional explicit repository identifier override",
     )
     sqlite: SQLiteConfig = Field(default_factory=SQLiteConfig)
     budget: ContextBudgetConfig = Field(default_factory=ContextBudgetConfig)
@@ -162,6 +171,8 @@ class BridgeConfig(BaseModel):
         return cls(
             db_path=Path(db_path),
             repo_root=Path(repo_root),
+            git_branch_override=os.environ.get("AGENT_BRIDGE_GIT_BRANCH"),
+            repo_id_override=os.environ.get("AGENT_BRIDGE_REPO_ID"),
             llm=LLMConfig(base_url=llm_base_url, model=llm_model),
             decision=DecisionConfig(
                 backend="typesafe_jev" if decision_backend == "typesafe_jev" else "local_embedded",

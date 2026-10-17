@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hybrid-agent-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zero-Container Local-First 4-Tier Memory & System-1/System-2 Hierarchical LangGraph Orchestration Framework"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,32 @@ license = { text = "MIT" }
 authors = [
     { name = "Principal AI Systems Architect" }
 ]
-keywords = ["ai-memory", "langgraph", "sqlite", "fts5", "sqlite-vec", "jev-mem", "local-llm", "ollama"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database :: Database Engines/Servers",
+]
+keywords = [
+    "ai-memory",
+    "langgraph",
+    "sqlite",
+    "fts5",
+    "sqlite-vec",
+    "jev-mem",
+    "local-llm",
+    "ollama",
+    "llama-cpp",
+    "vllm",
+]
 dependencies = [
     "pydantic>=2.7.0,<3.0.0",
     "pydantic-settings>=2.2.0,<3.0.0",
@@ -21,16 +46,35 @@ dependencies = [
     "sqlite-vec>=0.1.1,<0.2.0",
     "httpx>=0.27.0,<1.0.0",
     "numpy>=1.26.0,<3.0.0",
+    "rich>=13.7.0,<15.0.0",
 ]
 
 [project.optional-dependencies]
+tui = [
+    "textual>=0.70.0,<3.0.0",
+    "rich>=13.7.0,<15.0.0",
+]
 onnx = [
     "onnxruntime>=1.17.0,<2.0.0",
     "fastembed>=0.3.0,<1.0.0",
 ]
+benchmark = [
+    "psutil>=5.9.0,<7.0.0",
+    "httpx>=0.27.0,<1.0.0",
+    "tabulate>=0.9.0,<1.0.0",
+]
+all = [
+    "textual>=0.70.0,<3.0.0",
+    "rich>=13.7.0,<15.0.0",
+    "psutil>=5.9.0,<7.0.0",
+    "tabulate>=0.9.0,<1.0.0",
+]
 dev = [
     "pytest>=8.0.0,<9.0.0",
     "pytest-asyncio>=0.23.0,<1.0.0",
+    "textual>=0.70.0,<3.0.0",
+    "psutil>=5.9.0,<7.0.0",
+    "tabulate>=0.9.0,<1.0.0",
 ]
 
 [project.scripts]
