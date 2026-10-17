@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hybrid-agent-bridge"
+version = "0.1.0"
+description = "Zero-Container Local-First 4-Tier Memory & System-1/System-2 Hierarchical LangGraph Orchestration Framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Principal AI Systems Architect" }
+]
+keywords = ["ai-memory", "langgraph", "sqlite", "fts5", "sqlite-vec", "jev-mem", "local-llm", "ollama"]
+dependencies = [
+    "pydantic>=2.7.0,<3.0.0",
+    "pydantic-settings>=2.2.0,<3.0.0",
+    "langgraph>=0.2.0,<1.0.0",
+    "langgraph-checkpoint-sqlite>=2.0.0,<3.0.0",
+    "sqlite-vec>=0.1.1,<0.2.0",
+    "httpx>=0.27.0,<1.0.0",
+    "numpy>=1.26.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+onnx = [
+    "onnxruntime>=1.17.0,<2.0.0",
+    "fastembed>=0.3.0,<1.0.0",
+]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+    "pytest-asyncio>=0.23.0,<1.0.0",
+]
+
+[project.scripts]
+agentic = "agent_bridge.cli:main"
+agent-bridge = "agent_bridge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src"]
