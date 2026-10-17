@@ -270,27 +270,35 @@ class DeclarativeMemoryStore:
         target_branch = (git_branch or self.engine.git_context.git_branch).strip()
 
         with self.engine.connection() as conn:
-            cursor = conn.execute(
+            row = conn.execute(
                 """
-                UPDATE declarative_facts
-                SET pinned = ?
-                WHERE repo_identifier = ? AND git_branch = ? AND category = ? AND key = ?;
+                SELECT id FROM declarative_facts
+                WHERE repo_identifier IN (?, 'workspace:default')
+                  AND git_branch IN (?, 'default', 'main', 'master')
+                  AND category = ? AND key = ?
+                ORDER BY (repo_identifier = ?) DESC, (git_branch = ?) DESC, id DESC
+                LIMIT 1;
                 """,
-                (1 if pinned else 0, target_repo, target_branch, norm_category, norm_key),
-            )
-            if cursor.rowcount == 0:
+                (target_repo, target_branch, norm_category, norm_key, target_repo, target_branch),
+            ).fetchone()
+            if row is None:
                 raise KeyError(
                     f"Declarative fact ({norm_category!r}, {norm_key!r}) not found on branch {target_branch!r}."
                 )
-            row = conn.execute(
+            fact_id = int(row["id"])
+            conn.execute(
+                "UPDATE declarative_facts SET pinned = ? WHERE id = ?;",
+                (1 if pinned else 0, fact_id),
+            )
+            updated_row = conn.execute(
                 """
                 SELECT id, repo_identifier, git_branch, category, key, value_json, pinned, updated_at
                 FROM declarative_facts
-                WHERE repo_identifier = ? AND git_branch = ? AND category = ? AND key = ?;
+                WHERE id = ?;
                 """,
-                (target_repo, target_branch, norm_category, norm_key),
+                (fact_id,),
             ).fetchone()
-        return self._row_to_fact(row)
+        return self._row_to_fact(updated_row)
 
     def delete_fact(
         self,

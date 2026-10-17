@@ -1,5 +1,12 @@
 """Unified 4-Tier Memory Subsystem for Hybrid Agent Bridge."""
 
+from agent_bridge.memory.curation import (
+    ExplainedMemoryCandidate,
+    ExplainRetrievalReport,
+    ForgetResult,
+    MemoryCurator,
+    PruneResult,
+)
 from agent_bridge.memory.declarative import (
     DeclarativeFact,
     DeclarativeMemoryStore,
@@ -32,10 +39,15 @@ __all__ = [
     "DeclarativeMemoryStore",
     "EpisodicArtifact",
     "EpisodicMemoryStore",
+    "ExplainRetrievalReport",
+    "ExplainedMemoryCandidate",
+    "ForgetResult",
     "GitContextInfo",
     "InjectedContextBundle",
     "LocalMemoryEngine",
+    "MemoryCurator",
     "PinnedMemoryError",
+    "PruneResult",
     "compute_recency_decay",
     "deserialize_f32_vector",
     "detect_sqlite_vec_platform_guidance",
