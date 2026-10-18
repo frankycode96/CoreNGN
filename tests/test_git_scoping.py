@@ -132,7 +132,7 @@ def test_backward_compatible_v1_to_v2_schema_migration(tmp_path: Path) -> None:
 
     engine = LocalMemoryEngine(db_path=db_file, git_branch="main", repo_identifier="git:migrated:001")
     meta = engine.initialize()
-    assert meta["schema_version"] == 2
+    assert meta["schema_version"] == 3
 
     decl = DeclarativeMemoryStore(engine)
     migrated_fact = decl.get_fact("legacy", "version")

@@ -32,6 +32,7 @@ from agent_bridge.decision import (
 )
 from agent_bridge.memory import (
     CPUEmbedder,
+    ConsolidationResult,
     ContextInjector,
     DeclarativeFact,
     DeclarativeMemoryStore,
@@ -42,10 +43,14 @@ from agent_bridge.memory import (
     ForgetResult,
     GitContextInfo,
     InjectedContextBundle,
+    JournalEntry,
     LocalMemoryEngine,
     MemoryCurator,
+    MemoryTaxonomyType,
     PinnedMemoryError,
     PruneResult,
+    ReasoningJournalStore,
+    compute_normalized_rrf,
     compute_recency_decay,
     detect_sqlite_vec_platform_guidance,
     estimate_tokens,
@@ -58,10 +63,21 @@ from agent_bridge.orchestrator import (
     IsolatedSubWorker,
     SubWorkerOutput,
 )
+from agent_bridge.rlm import (
+    RLMChunk,
+    RLMPeekResult,
+    RLMSearchMatch,
+    RLMWorkspaceToolkit,
+)
 from agent_bridge.runtime import (
     ProviderProbeResult,
     RuntimeDetector,
     RuntimeDiagnosticReport,
+)
+from agent_bridge.sandbox import (
+    CodeSandboxValidator,
+    SafeEnv,
+    SandboxValidationResult,
 )
 from agent_bridge.ui import (
     AgentBridgeTUI,
@@ -69,7 +85,7 @@ from agent_bridge.ui import (
     render_rich_dashboard_snapshot,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AgentBridgeTUI",
@@ -79,6 +95,8 @@ __all__ = [
     "BridgeGraphState",
     "CPUEmbedder",
     "ChoiceResult",
+    "CodeSandboxValidator",
+    "ConsolidationResult",
     "ContextBudgetConfig",
     "ContextInjector",
     "DecisionConfig",
@@ -96,24 +114,34 @@ __all__ = [
     "HybridAgentBridgeRunner",
     "InjectedContextBundle",
     "IsolatedSubWorker",
+    "JournalEntry",
     "LLMConfig",
     "LatencyProfile",
     "LocalHeuristicDecisionEngine",
     "LocalMemoryEngine",
     "MemoryCurator",
+    "MemoryTaxonomyType",
     "NoulResult",
     "PinnedMemoryError",
     "ProviderProbeResult",
     "PruneResult",
+    "RLMChunk",
+    "RLMPeekResult",
+    "RLMSearchMatch",
+    "RLMWorkspaceToolkit",
+    "ReasoningJournalStore",
     "RuntimeDetector",
     "RuntimeDiagnosticReport",
     "SQLiteConfig",
+    "SafeEnv",
+    "SandboxValidationResult",
     "ScoreResult",
     "SubWorkerConfig",
     "SubWorkerOutput",
     "ThroughputMetrics",
     "TypeSafeJevClient",
     "__version__",
+    "compute_normalized_rrf",
     "compute_recency_decay",
     "compute_repo_truth_diffs",
     "create_decision_engine",

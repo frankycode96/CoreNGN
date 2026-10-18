@@ -2,15 +2,17 @@
 
 Implements the Zero-Container Local-First persistence engine on a single SQLite
 file in WAL mode with:
-1. Working Memory: LangGraph SqliteSaver atomic checkpoints.
+1. Working Memory: LangGraph SqliteSaver atomic checkpoints + `reasoning_journal` (Thought Journal).
 2. Declarative Memory: `declarative_facts` scoped by `(repo_identifier, git_branch, category, key)`
-   with deterministic UPSERT and immutability pinning (`pinned`).
+   with typed taxonomy (`FACT`, `BELIEF` 30-day TTL, `PREFERENCE`, `IDENTITY`, `RULE`, `EXPERIENCE`),
+   deterministic UPSERT, immutability pinning (`pinned`), and `memory_audit_log`.
 3. Semantic & Episodic Memory: `episodic_artifacts` scoped by `(repo_identifier, git_branch)`
    and indexed via SQLite FTS5 (BM25) and CPU-embedded vector columns (`sqlite-vec` + SQLite float32 cosine UDF).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import platform
 import sqlite3
@@ -19,7 +21,7 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -28,15 +30,15 @@ from agent_bridge.memory.git_context import GitContextInfo, resolve_git_context
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-CORE_DDL_V2 = """
+CORE_DDL_V3 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
 );
 
--- Layer 2: Declarative Memory (Git-Branch Scoped, Deterministic Upsert, Pinning Support)
+-- Layer 2: Declarative Memory (Git-Branch Scoped, Typed Taxonomy, TTL, Deterministic Upsert, Pinning)
 CREATE TABLE IF NOT EXISTS declarative_facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_identifier TEXT NOT NULL DEFAULT 'workspace:default',
@@ -44,7 +46,10 @@ CREATE TABLE IF NOT EXISTS declarative_facts (
     category TEXT NOT NULL,
     key TEXT NOT NULL,
     value_json TEXT NOT NULL,
+    memory_type TEXT NOT NULL DEFAULT 'FACT',
     pinned INTEGER NOT NULL DEFAULT 0,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
     updated_at TEXT NOT NULL,
     CONSTRAINT uq_declarative_repo_branch_cat_key UNIQUE (repo_identifier, git_branch, category, key)
 );
@@ -54,6 +59,9 @@ CREATE INDEX IF NOT EXISTS idx_declarative_repo_branch_cat_key
 
 CREATE INDEX IF NOT EXISTS idx_declarative_category_updated
     ON declarative_facts (category, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_declarative_expires_at
+    ON declarative_facts (expires_at);
 
 -- Layer 3 & 4: Semantic & Episodic Memory (Git-Branch Scoped, Validated Task/Artifact pairs only)
 CREATE TABLE IF NOT EXISTS episodic_artifacts (
@@ -102,6 +110,38 @@ CREATE TRIGGER IF NOT EXISTS trg_episodic_au AFTER UPDATE ON episodic_artifacts 
     INSERT INTO episodic_artifacts_fts(rowid, task, final_artifact, tags_json)
     VALUES (new.id, new.task, new.final_artifact, new.tags_json);
 END;
+
+-- Memory Audit Log (Deterministic record of merges, pins, forgets, and conflict overrides)
+CREATE TABLE IF NOT EXISTS memory_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_identifier TEXT NOT NULL DEFAULT 'workspace:default',
+    git_branch TEXT NOT NULL DEFAULT 'default',
+    action TEXT NOT NULL,
+    target_tier TEXT NOT NULL,
+    target_ref TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_audit_created
+    ON memory_audit_log (created_at DESC);
+
+-- Thought Journal (`reasoning_book` - structured reasoning steps decoupled from episodic artifacts)
+CREATE TABLE IF NOT EXISTS reasoning_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_identifier TEXT NOT NULL DEFAULT 'workspace:default',
+    git_branch TEXT NOT NULL DEFAULT 'default',
+    thread_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    step_index INTEGER NOT NULL DEFAULT 1,
+    node_name TEXT NOT NULL,
+    thought_summary TEXT NOT NULL,
+    noul_confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reasoning_journal_thread
+    ON reasoning_journal (repo_identifier, git_branch, thread_id, step_index ASC);
 """
 
 
@@ -158,7 +198,7 @@ def detect_sqlite_vec_platform_guidance() -> str:
 
 
 class LocalMemoryEngine:
-    """Unified embedded SQLite engine managing Working, Declarative, and Episodic memory layers."""
+    """Unified embedded SQLite engine managing Working, Declarative, Episodic, and Journal layers."""
 
     def __init__(
         self,
@@ -218,10 +258,8 @@ class LocalMemoryEngine:
         conn.execute(f"PRAGMA cache_size = {int(sqlite_cfg.cache_size_kb)};")
         conn.execute(f"PRAGMA foreign_keys = {'ON' if sqlite_cfg.foreign_keys else 'OFF'};")
 
-        # Register in-process CPU vector similarity function for guaranteed zero-VRAM SQL vector queries
         conn.create_function("vec_cosine_similarity", 2, _sqlite_cosine_similarity, deterministic=True)
 
-        # Cross-platform loading of native C sqlite-vec extension
         if not hasattr(conn, "enable_load_extension"):
             self.sqlite_vec_enabled = False
             self.sqlite_vec_diagnostic = (
@@ -238,7 +276,7 @@ class LocalMemoryEngine:
             conn.enable_load_extension(False)
             self.sqlite_vec_enabled = True
             self.sqlite_vec_diagnostic = f"loaded ({sys.platform}/{platform.machine().lower()})"
-        except Exception as exc:  # pragma: no cover - graceful fallback when load_extension disabled
+        except Exception as exc:  # pragma: no cover
             self.sqlite_vec_enabled = False
             self.sqlite_vec_diagnostic = (
                 f"fallback_udf ({exc}). {detect_sqlite_vec_platform_guidance()}"
@@ -264,8 +302,8 @@ class LocalMemoryEngine:
         finally:
             conn.close()
 
-    def _migrate_v1_to_v2_if_needed(self, conn: sqlite3.Connection) -> None:
-        """Idempotently migrate v1 schemas to v2 (`repo_identifier`, `git_branch`, `pinned`)."""
+    def _migrate_to_v3_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Idempotently migrate v1/v2 schemas to v3 (`memory_type`, `expires_at`, `access_count`)."""
         decl_info = conn.execute("PRAGMA table_info(declarative_facts);").fetchall()
         if decl_info:
             col_names = {str(r["name"]) for r in decl_info}
@@ -282,16 +320,34 @@ class LocalMemoryEngine:
                         category TEXT NOT NULL,
                         key TEXT NOT NULL,
                         value_json TEXT NOT NULL,
+                        memory_type TEXT NOT NULL DEFAULT 'FACT',
                         pinned INTEGER NOT NULL DEFAULT 0,
+                        access_count INTEGER NOT NULL DEFAULT 0,
+                        expires_at TEXT,
                         updated_at TEXT NOT NULL,
                         CONSTRAINT uq_declarative_repo_branch_cat_key UNIQUE (repo_identifier, git_branch, category, key)
                     );
-                    INSERT INTO declarative_facts (id, repo_identifier, git_branch, category, key, value_json, pinned, updated_at)
-                    SELECT id, {default_repo!r}, {default_branch!r}, category, key, value_json, 0, updated_at
+                    INSERT INTO declarative_facts (
+                        id, repo_identifier, git_branch, category, key, value_json,
+                        memory_type, pinned, access_count, expires_at, updated_at
+                    )
+                    SELECT id, {default_repo!r}, {default_branch!r}, category, key, value_json,
+                           'FACT', 0, 0, NULL, updated_at
                     FROM _declarative_facts_v1;
                     DROP TABLE _declarative_facts_v1;
                     """
                 )
+            else:
+                if "memory_type" not in col_names:
+                    conn.execute(
+                        "ALTER TABLE declarative_facts ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'FACT';"
+                    )
+                if "access_count" not in col_names:
+                    conn.execute(
+                        "ALTER TABLE declarative_facts ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;"
+                    )
+                if "expires_at" not in col_names:
+                    conn.execute("ALTER TABLE declarative_facts ADD COLUMN expires_at TEXT;")
 
         ep_info = conn.execute("PRAGMA table_info(episodic_artifacts);").fetchall()
         if ep_info:
@@ -310,8 +366,8 @@ class LocalMemoryEngine:
     def initialize(self) -> dict[str, object]:
         """Initialize or migrate database schemas, FTS5 virtual tables, and sqlite-vec tables."""
         with self.connection() as conn:
-            self._migrate_v1_to_v2_if_needed(conn)
-            conn.executescript(CORE_DDL_V2)
+            self._migrate_to_v3_if_needed(conn)
+            conn.executescript(CORE_DDL_V3)
 
             if self.sqlite_vec_enabled:
                 dim = int(self.config.sqlite.vector_dim)
@@ -342,6 +398,61 @@ class LocalMemoryEngine:
             "repo_identifier": self.git_context.repo_identifier,
             "git_branch": self.git_context.git_branch,
         }
+
+    def record_audit_event(
+        self,
+        action: str,
+        target_tier: str,
+        target_ref: str,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        """Persist a deterministic entry in `memory_audit_log`."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO memory_audit_log (
+                    repo_identifier, git_branch, action, target_tier, target_ref, details_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    self.git_context.repo_identifier,
+                    self.git_context.git_branch,
+                    action,
+                    target_tier,
+                    target_ref,
+                    json.dumps(details or {}, ensure_ascii=False),
+                    now_iso,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_audit_events(self, limit: int = 25) -> list[dict[str, Any]]:
+        """Retrieve recent entries from `memory_audit_log`."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, repo_identifier, git_branch, action, target_tier, target_ref, details_json, created_at
+                FROM memory_audit_log
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [
+            {
+                "id": int(r["id"]),
+                "repo_identifier": str(r["repo_identifier"]),
+                "git_branch": str(r["git_branch"]),
+                "action": str(r["action"]),
+                "target_tier": str(r["target_tier"]),
+                "target_ref": str(r["target_ref"]),
+                "details": json.loads(r["details_json"] or "{}"),
+                "created_at": str(r["created_at"]),
+            }
+            for r in rows
+        ]
 
     @contextmanager
     def langgraph_checkpointer(self) -> Iterator[object]:
@@ -396,6 +507,8 @@ class LocalMemoryEngine:
             decl_count = conn.execute("SELECT COUNT(*) FROM declarative_facts;").fetchone()[0]
             pinned_decl = conn.execute("SELECT COUNT(*) FROM declarative_facts WHERE pinned = 1;").fetchone()[0]
             ep_count = conn.execute("SELECT COUNT(*) FROM episodic_artifacts;").fetchone()[0]
+            journal_count = conn.execute("SELECT COUNT(*) FROM reasoning_journal;").fetchone()[0]
+            audit_count = conn.execute("SELECT COUNT(*) FROM memory_audit_log;").fetchone()[0]
             branch_rows = conn.execute(
                 "SELECT DISTINCT git_branch FROM declarative_facts UNION SELECT DISTINCT git_branch FROM episodic_artifacts;"
             ).fetchall()
@@ -409,6 +522,8 @@ class LocalMemoryEngine:
             "declarative_facts_count": int(decl_count),
             "pinned_facts_count": int(pinned_decl),
             "episodic_artifacts_count": int(ep_count),
+            "reasoning_journal_count": int(journal_count),
+            "audit_events_count": int(audit_count),
             "sqlite_vec_enabled": self.sqlite_vec_enabled,
             "sqlite_vec_diagnostic": self.sqlite_vec_diagnostic,
             "repo_identifier": self.git_context.repo_identifier,

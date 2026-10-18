@@ -1,6 +1,8 @@
 """Unified 4-Tier Memory Subsystem for Hybrid Agent Bridge."""
 
 from agent_bridge.memory.curation import (
+    ConsolidatedPair,
+    ConsolidationResult,
     ExplainedMemoryCandidate,
     ExplainRetrievalReport,
     ForgetResult,
@@ -8,8 +10,11 @@ from agent_bridge.memory.curation import (
     PruneResult,
 )
 from agent_bridge.memory.declarative import (
+    DEFAULT_BELIEF_TTL_DAYS,
+    VALID_MEMORY_TYPES,
     DeclarativeFact,
     DeclarativeMemoryStore,
+    MemoryTaxonomyType,
     PinnedMemoryError,
 )
 from agent_bridge.memory.engine import (
@@ -19,9 +24,11 @@ from agent_bridge.memory.engine import (
     serialize_f32_vector,
 )
 from agent_bridge.memory.episodic import (
+    DEFAULT_RRF_K,
     CPUEmbedder,
     EpisodicArtifact,
     EpisodicMemoryStore,
+    compute_normalized_rrf,
     compute_recency_decay,
 )
 from agent_bridge.memory.git_context import GitContextInfo, resolve_git_context
@@ -31,10 +38,15 @@ from agent_bridge.memory.injector import (
     estimate_tokens,
     inject_bounded_context,
 )
+from agent_bridge.memory.journal import JournalEntry, ReasoningJournalStore
 
 __all__ = [
     "CPUEmbedder",
+    "ConsolidatedPair",
+    "ConsolidationResult",
     "ContextInjector",
+    "DEFAULT_BELIEF_TTL_DAYS",
+    "DEFAULT_RRF_K",
     "DeclarativeFact",
     "DeclarativeMemoryStore",
     "EpisodicArtifact",
@@ -44,10 +56,15 @@ __all__ = [
     "ForgetResult",
     "GitContextInfo",
     "InjectedContextBundle",
+    "JournalEntry",
     "LocalMemoryEngine",
     "MemoryCurator",
+    "MemoryTaxonomyType",
     "PinnedMemoryError",
     "PruneResult",
+    "ReasoningJournalStore",
+    "VALID_MEMORY_TYPES",
+    "compute_normalized_rrf",
     "compute_recency_decay",
     "deserialize_f32_vector",
     "detect_sqlite_vec_platform_guidance",

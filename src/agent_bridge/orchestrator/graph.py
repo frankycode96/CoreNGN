@@ -1,10 +1,12 @@
 """The Bridge: Hierarchical LangGraph Macro-FSM Runner (`graph.py`).
 
 Wires the 4-node deterministic orchestration topology:
-1. `Context_Loader`: Pure Python extraction of Repo Truth, Declarative Facts, and Episodic Memories (< 800 tokens).
+1. `Context_Loader`: Pure Python extraction of Repo Truth (via RLM `peek`/`search`), Declarative Facts,
+   and Episodic Memories (< 800 tokens).
 2. `SubWorker_Node`: Sandboxed async sub-cluster (`<= 3` rounds, `<= 120s` timeout, immediate scratchpad destruction).
-3. `System1_Gatekeeper`: Jev/Local System-1 verification (`Score` + `Noul`) gating retry vs consolidation.
-4. `Episodic_Consolidator`: Compaction and persistence of validated `(Task, Final_Artifact)` pairs into SQLite.
+3. `System1_Gatekeeper`: Jev/Local System-1 verification (`Score` + `Noul` + 5-Layer AST Sandbox) gating retry vs consolidation.
+4. `Episodic_Consolidator`: Compaction, persistence of validated `(Task, Final_Artifact)` pairs into SQLite,
+   automatic semantic deduplication (`cosine >= 0.92`), and `reasoning_journal` recording.
 """
 
 from __future__ import annotations
@@ -17,10 +19,12 @@ from langgraph.graph import END, START, StateGraph
 from agent_bridge.config import BridgeConfig
 from agent_bridge.decision.base import DecisionEngine
 from agent_bridge.decision.jev_client import create_decision_engine
+from agent_bridge.memory.curation import MemoryCurator
 from agent_bridge.memory.declarative import DeclarativeMemoryStore
 from agent_bridge.memory.engine import LocalMemoryEngine
 from agent_bridge.memory.episodic import EpisodicMemoryStore
 from agent_bridge.memory.injector import ContextInjector
+from agent_bridge.memory.journal import ReasoningJournalStore
 from agent_bridge.orchestrator.state import AuditEntry, BridgeGraphState
 from agent_bridge.orchestrator.subworker import AsyncLLMCallable, IsolatedSubWorker
 
@@ -42,6 +46,8 @@ class HybridAgentBridgeRunner:
 
         self.declarative = DeclarativeMemoryStore(self.engine)
         self.episodic = EpisodicMemoryStore(self.engine)
+        self.journal = ReasoningJournalStore(self.engine)
+        self.curator = MemoryCurator(self.engine, self.declarative, self.episodic)
         self.injector = ContextInjector(
             engine=self.engine,
             declarative_store=self.declarative,
@@ -61,8 +67,8 @@ class HybridAgentBridgeRunner:
     def context_loader_node(self, state: BridgeGraphState) -> dict[str, Any]:
         """Pure Python extraction of Repo Truth, declarative facts, and salient episodes (< 800 tokens)."""
         task = state["task"]
+        thread_id = state.get("thread_id") or "default-thread"
 
-        # Apply any explicit declarative updates routed at task start
         decl_updates = state.get("declarative_updates") or {}
         upserted_count = 0
         for category, kv_map in decl_updates.items():
@@ -81,6 +87,20 @@ class HybridAgentBridgeRunner:
         )
 
         trail = list(state.get("audit_trail") or [])
+        step_idx = len(trail) + 1
+        self.journal.record_thought(
+            thread_id=thread_id,
+            task=task,
+            step_index=step_idx,
+            node_name="Context_Loader",
+            thought_summary=(
+                f"Assembled bounded context ({bundle.estimated_tokens}/{bundle.max_token_budget} tok): "
+                f"{len(bundle.repo_truth_entries)} repo_truth, {len(bundle.included_facts)} facts, "
+                f"{len(bundle.included_episodes)} episodes."
+            ),
+            noul_confidence=1.0,
+        )
+
         trail.append(
             AuditEntry(
                 node="Context_Loader",
@@ -112,6 +132,7 @@ class HybridAgentBridgeRunner:
     def subworker_node(self, state: BridgeGraphState) -> dict[str, Any]:
         """Sandboxed exploratory sub-cluster with mandatory 120s timeout and scratchpad cleanup."""
         task = state["task"]
+        thread_id = state.get("thread_id") or "default-thread"
         injected_context = state.get("injected_context") or ""
         feedback = state.get("gatekeeper_feedback") or ""
 
@@ -122,6 +143,19 @@ class HybridAgentBridgeRunner:
         )
 
         trail = list(state.get("audit_trail") or [])
+        step_idx = len(trail) + 1
+        self.journal.record_thought(
+            thread_id=thread_id,
+            task=task,
+            step_index=step_idx,
+            node_name="SubWorker_Node",
+            thought_summary=(
+                f"Completed synthesis in {output.rounds_used} round(s) via {output.inference_mode} "
+                f"(converged_noul={output.converged_noul:.2f}, scratchpad_destroyed={output.scratchpad_destroyed})."
+            ),
+            noul_confidence=output.converged_noul,
+        )
+
         trail.append(
             AuditEntry(
                 node="SubWorker_Node",
@@ -149,8 +183,9 @@ class HybridAgentBridgeRunner:
     # Node 3: System1_Gatekeeper
     # ------------------------------------------------------------------
     def system1_gatekeeper_node(self, state: BridgeGraphState) -> dict[str, Any]:
-        """System-1 Gatekeeper validating syntax, completeness, and compliance via Score + Noul."""
+        """System-1 Gatekeeper validating syntax, 5-layer sandbox safety, and compliance via Score + Noul."""
         task = state["task"]
+        thread_id = state.get("thread_id") or "default-thread"
         candidate = state.get("candidate_artifact") or ""
         retry_count = int(state.get("retry_count") or 0)
         max_retries = int(self.config.subworker.max_gatekeeper_retries)
@@ -170,6 +205,16 @@ class HybridAgentBridgeRunner:
         )
 
         trail = list(state.get("audit_trail") or [])
+        step_idx = len(trail) + 1
+        self.journal.record_thought(
+            thread_id=thread_id,
+            task=task,
+            step_index=step_idx,
+            node_name="System1_Gatekeeper",
+            thought_summary=f"Verdict={verdict.action}: {verdict.feedback}",
+            noul_confidence=verdict.compliance_probability,
+        )
+
         trail.append(
             AuditEntry(
                 node="System1_Gatekeeper",
@@ -200,15 +245,16 @@ class HybridAgentBridgeRunner:
     # Node 4: Episodic_Consolidator
     # ------------------------------------------------------------------
     def episodic_consolidator_node(self, state: BridgeGraphState) -> dict[str, Any]:
-        """Compaction node: discards intermediate messages and saves validated artifact in SQLite."""
+        """Compaction node: discards intermediate messages, saves validated artifact, and deduplicates."""
         task = state["task"]
+        thread_id = state.get("thread_id") or "default-thread"
         candidate = state.get("candidate_artifact") or ""
         quality = float(state.get("gatekeeper_score") or 1.0)
         tags = list(state.get("tags") or ["validated", "langgraph-bridge"])
 
-        # Confirm via System-1 Choice that the artifact should be consolidated into episodic storage
         route = self.decision.route_memory_ingestion({"task": task, "artifact": candidate})
         episode_id: int | None = None
+        merged_duplicates = 0
         if route.chosen != "discard":
             episode = self.episodic.record_episode(
                 task=task,
@@ -217,8 +263,23 @@ class HybridAgentBridgeRunner:
                 quality_score=quality,
             )
             episode_id = episode.id
+            consolidation = self.curator.consolidate_duplicates(similarity_threshold=0.92, dry_run=False)
+            merged_duplicates = consolidation.total_merged
 
         trail = list(state.get("audit_trail") or [])
+        step_idx = len(trail) + 1
+        self.journal.record_thought(
+            thread_id=thread_id,
+            task=task,
+            step_index=step_idx,
+            node_name="Episodic_Consolidator",
+            thought_summary=(
+                f"Consolidated episode_id={episode_id} (quality={quality:.2f}, "
+                f"auto_merged_duplicates={merged_duplicates})."
+            ),
+            noul_confidence=quality,
+        )
+
         trail.append(
             AuditEntry(
                 node="Episodic_Consolidator",
@@ -227,6 +288,7 @@ class HybridAgentBridgeRunner:
                     "episode_id": episode_id,
                     "routed_tier": route.chosen,
                     "quality_score": quality,
+                    "auto_merged_duplicates": merged_duplicates,
                 },
             )
         )

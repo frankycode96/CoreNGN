@@ -1,8 +1,8 @@
 """Offline Local System-1 Driver (`local_embedded`).
 
-Executes deterministic AST syntax verification, placeholder detection, lexical/vector
-alignment, and optional quantized ONNX Runtime CPU classification in sub-millisecond time.
-Never invokes the generative System-2 LLM.
+Executes deterministic AST syntax verification, 5-layer security sandbox validation,
+placeholder detection, lexical/vector alignment, and optional quantized ONNX Runtime
+CPU classification in sub-millisecond time. Never invokes the generative System-2 LLM.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import numpy as np
 
 from agent_bridge.decision.base import ChoiceResult, DecisionEngine, NoulResult, ScoreResult
 from agent_bridge.memory.episodic import CPUEmbedder
+from agent_bridge.sandbox.validator import CodeSandboxValidator
 
 _CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _PLACEHOLDER_RE = re.compile(
@@ -41,9 +42,15 @@ def _softmax(logits: dict[str, float]) -> dict[str, float]:
 class LocalHeuristicDecisionEngine(DecisionEngine):
     """Offline CPU-based System-1 Decision Controller (`local_embedded` driver)."""
 
-    def __init__(self, onnx_model_path: Path | None = None, vector_dim: int = 64) -> None:
+    def __init__(
+        self,
+        onnx_model_path: Path | None = None,
+        vector_dim: int = 64,
+        sandbox_validator: CodeSandboxValidator | None = None,
+    ) -> None:
         self.onnx_model_path = onnx_model_path
         self.embedder = CPUEmbedder(dim=vector_dim)
+        self.sandbox = sandbox_validator or CodeSandboxValidator()
         self._onnx_session: Any = None
         if onnx_model_path and onnx_model_path.exists():
             self._try_load_onnx(onnx_model_path)
@@ -79,7 +86,6 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
         fenced_blocks = _CODE_FENCE_RE.findall(cleaned)
         candidates = fenced_blocks if fenced_blocks else []
 
-        # Also check if raw text itself looks like Python source
         if not candidates and any(
             cleaned.startswith(prefix)
             for prefix in ("def ", "class ", "import ", "from ", "async def ", "@", '"""', "#")
@@ -89,7 +95,6 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
         for idx, block in enumerate(candidates):
             try:
                 tree = ast.parse(block)
-                # Check for empty stub functions that only contain `pass` or `...`
                 for node in ast.walk(tree):
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         body = [
@@ -98,7 +103,7 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
                             if not (
                                 isinstance(stmt, ast.Expr)
                                 and isinstance(getattr(stmt, "value", None), ast.Constant)
-                                and isinstance( getattr(stmt.value, "value", None), str)
+                                and isinstance(getattr(stmt.value, "value", None), str)
                             )
                         ]
                         if len(body) == 1 and isinstance(body[0], ast.Pass):
@@ -163,6 +168,7 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
 
         lowered_text = text.lower().strip()
         syntax_ok, _ = self.inspect_python_syntax(text)
+        sandbox_res = self.sandbox.validate_artifact(text)
         has_placeholders = bool(_PLACEHOLDER_RE.search(text))
         has_error = any(
             err in lowered_text
@@ -172,7 +178,7 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
         for opt in unique_opts:
             opt_l = opt.lower()
             if opt_l in {"discard", "abort", "reject"}:
-                if not lowered_text or has_error or has_placeholders or not syntax_ok:
+                if not lowered_text or has_error or has_placeholders or not syntax_ok or not sandbox_res.safe:
                     logits[opt] += 3.2
                 else:
                     logits[opt] -= 1.5
@@ -184,23 +190,24 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
                 else:
                     logits[opt] -= 0.4
             elif opt_l in {"episodic", "artifact", "consolidate", "accept"}:
-                if syntax_ok and not has_placeholders and not has_error and len(text.strip()) >= 20:
+                if syntax_ok and sandbox_res.safe and not has_placeholders and not has_error and len(text.strip()) >= 20:
                     logits[opt] += 2.8
                 else:
                     logits[opt] -= 1.2
             elif opt_l == "retry":
-                if (not syntax_ok or has_placeholders) and int(st.get("retry_count", 0)) < int(st.get("max_retries", 2)):
+                if (
+                    (not syntax_ok or not sandbox_res.safe or has_placeholders)
+                    and int(st.get("retry_count", 0)) < int(st.get("max_retries", 2))
+                ):
                     logits[opt] += 2.5
                 else:
                     logits[opt] -= 0.8
             else:
-                # Generic lexical/vector similarity between option label and state/question
                 sim = self._compute_alignment(f"{question} {opt}", f"{task} {text}")
                 logits[opt] += sim * 2.0
 
         dist = _softmax(logits)
         chosen = max(dist.items(), key=lambda kv: kv[1])[0]
-        # Renormalize rounding drift so sum is strictly 1.0
         drift = round(1.0 - sum(dist.values()), 6)
         dist[chosen] = round(max(0.0, min(1.0, dist[chosen] + drift)), 6)
 
@@ -225,13 +232,21 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
         if not artifact.strip():
             return ScoreResult(
                 score=0.0,
-                rubric_breakdown={"syntax_integrity": 0.0, "no_placeholders": 0.0, "task_alignment": 0.0},
+                rubric_breakdown={
+                    "syntax_integrity": 0.0,
+                    "no_placeholders": 0.0,
+                    "sandbox_safety": 0.0,
+                    "task_alignment": 0.0,
+                },
                 rationale="Artifact is empty.",
                 backend="local_embedded",
             )
 
         syntax_ok, syntax_msg = self.inspect_python_syntax(artifact)
         syntax_score = 1.0 if syntax_ok else 0.0
+
+        sandbox_res = self.sandbox.validate_artifact(artifact)
+        sandbox_score = sandbox_res.safety_score
 
         placeholder_matches = _PLACEHOLDER_RE.findall(artifact)
         placeholder_score = 1.0 if not placeholder_matches else max(0.0, 1.0 - 0.5 * len(placeholder_matches))
@@ -244,29 +259,35 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
             for marker in ("traceback (most recent call last):", "__subworker_timeout_error__", "unhandled exception:")
         )
 
-        if has_fatal_error or not syntax_ok:
+        if has_fatal_error or not syntax_ok or not sandbox_res.safe:
             total_score = round(0.15 * alignment_score, 4)
         else:
             total_score = round(
-                0.40 * syntax_score + 0.30 * placeholder_score + 0.30 * max(0.65, alignment_score),
+                0.35 * syntax_score
+                + 0.25 * placeholder_score
+                + 0.15 * sandbox_score
+                + 0.25 * max(0.65, alignment_score),
                 4,
             )
 
         reasons: list[str] = []
         if not syntax_ok:
             reasons.append(syntax_msg)
+        if not sandbox_res.safe:
+            reasons.extend(sandbox_res.violations)
         if placeholder_matches:
             reasons.append(f"Contains forbidden placeholders: {', '.join(sorted(set(placeholder_matches)))}")
         if has_fatal_error:
             reasons.append("Contains runtime error or traceback marker")
         if not reasons:
-            reasons.append("All AST syntax, anti-placeholder, and task alignment checks passed")
+            reasons.append("All AST syntax, 5-layer sandbox, anti-placeholder, and task alignment checks passed")
 
         return ScoreResult(
             score=max(0.0, min(1.0, total_score)),
             rubric_breakdown={
                 "syntax_integrity": round(syntax_score, 4),
                 "no_placeholders": round(placeholder_score, 4),
+                "sandbox_safety": round(sandbox_score, 4),
                 "task_alignment": round(alignment_score, 4),
             },
             rationale="; ".join(reasons),
@@ -286,11 +307,9 @@ class LocalHeuristicDecisionEngine(DecisionEngine):
         score_res = self.score(state=st, question=proposition, scale_rubric={})
         prop_lower = proposition.lower()
 
-        # Check if proposition asks about error/failure vs validity/completion
         asks_negative = any(w in prop_lower for w in ("error", "invalid", "fail", "incomplete", "missing"))
         base_prob = score_res.score
 
-        # Factor in explicit assertions in state dict when present
         if "verified" in st and isinstance(st["verified"], bool):
             base_prob = (base_prob + (1.0 if st["verified"] else 0.0)) / 2.0
 

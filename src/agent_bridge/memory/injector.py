@@ -1,7 +1,9 @@
-"""Bounded Context Injector (< 800 tokens) with Repo Truth Hierarchy enforcement.
+"""Bounded Context Injector (< 800 tokens) with RLM Repo Truth Hierarchy enforcement.
 
 Guarantees that injected memory blocks never saturate the local model's KV-cache
 and enforces the invariant: Repo Truth Hierarchy > Declarative Memory > Episodic Memory.
+Uses `RLMWorkspaceToolkit` (`peek`, `search`) to extract surgical line-bounded slices
+from workspace files rather than dumping full files into context.
 """
 
 from __future__ import annotations
@@ -16,8 +18,12 @@ from pydantic import BaseModel, Field
 from agent_bridge.memory.declarative import DeclarativeFact, DeclarativeMemoryStore
 from agent_bridge.memory.engine import LocalMemoryEngine
 from agent_bridge.memory.episodic import EpisodicArtifact, EpisodicMemoryStore
+from agent_bridge.rlm.tools import RLMWorkspaceToolkit
 
-_FILE_PATH_RE = re.compile(r"(?:[a-zA-Z0-9_\-\.]+/)+[a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+|[a-zA-Z0-9_\-]+\.(?:py|toml|md|json|yaml|yml|sql|sh)")
+_FILE_PATH_RE = re.compile(
+    r"(?:[a-zA-Z0-9_\-\.]+/)+[a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+|[a-zA-Z0-9_\-]+\.(?:py|toml|md|json|yaml|yml|sql|sh)"
+)
+_SYMBOL_RE = re.compile(r"\b[a-zA-Z_][a-zA-Z0-9_]{3,}\b")
 
 
 class InjectedContextBundle(BaseModel):
@@ -51,30 +57,35 @@ class ContextInjector:
         engine: LocalMemoryEngine,
         declarative_store: DeclarativeMemoryStore | None = None,
         episodic_store: EpisodicMemoryStore | None = None,
+        rlm_toolkit: RLMWorkspaceToolkit | None = None,
     ) -> None:
         self.engine = engine
         self.declarative = declarative_store or DeclarativeMemoryStore(engine)
         self.episodic = episodic_store or EpisodicMemoryStore(engine)
+        self.rlm = rlm_toolkit or RLMWorkspaceToolkit(engine.config.repo_root)
 
     def _probe_repo_truth(self, task: str, facts: list[DeclarativeFact]) -> tuple[list[str], set[tuple[str, str]]]:
-        """Verify live repository filesystem truth and invalidate stale file memories.
-
-        Returns:
-            Tuple of (repo_truth_lines, invalidated_fact_keys)
-        """
+        """Verify live repository filesystem truth via RLM `peek`/`search` and invalidate stale file memories."""
         repo_root: Path = self.engine.config.repo_root
+        self.rlm.repo_root = repo_root.resolve()
         referenced_paths: set[str] = set(_FILE_PATH_RE.findall(task))
 
         for fact in facts:
             if fact.category in {"repo_file", "filesystem", "file"}:
                 referenced_paths.add(fact.key)
 
+        task_symbols = [
+            s
+            for s in _SYMBOL_RE.findall(task)
+            if s.lower()
+            not in {"write", "create", "implement", "python", "function", "refactor", "check", "aligned", "with", "that"}
+        ]
+
         repo_truth_lines: list[str] = []
         invalidated_keys: set[tuple[str, str]] = set()
 
         for rel_str in sorted(referenced_paths)[:6]:
             candidate = (repo_root / rel_str).resolve()
-            # Security check: ensure candidate remains inside repo_root
             try:
                 candidate.relative_to(repo_root.resolve())
             except ValueError:
@@ -82,13 +93,26 @@ class ContextInjector:
 
             if candidate.exists() and candidate.is_file():
                 stat = candidate.stat()
-                try:
-                    content_preview = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
-                    first_non_empty = next((ln.strip() for ln in content_preview if ln.strip()), "")[:90]
-                except OSError:
-                    first_non_empty = ""
+                peek_res = self.rlm.peek(rel_str, start_line=1, end_line=4)
+                first_non_empty = next(
+                    (
+                        ln.split(": ", 1)[1].strip()
+                        for ln in peek_res.snippet.splitlines()
+                        if ": " in ln and ln.split(": ", 1)[1].strip()
+                    ),
+                    "",
+                )[:90]
+
+                # Also run surgical RLM search if a task symbol matches inside the file
+                matched_symbol_note = ""
+                for sym in task_symbols[:3]:
+                    hits = self.rlm.search(sym, rel_path=rel_str, max_matches=1)
+                    if hits:
+                        matched_symbol_note = f" | rlm_match L{hits[0].line_number}: {hits[0].line_text[:60]!r}"
+                        break
+
                 repo_truth_lines.append(
-                    f"- {rel_str}: EXISTS ({stat.st_size}B) | head: {first_non_empty!r}"
+                    f"- {rel_str}: EXISTS ({stat.st_size}B, {peek_res.total_lines}L) | head: {first_non_empty!r}{matched_symbol_note}"
                 )
             else:
                 repo_truth_lines.append(f"- {rel_str}: MISSING_ON_DISK (Repo Truth overrides memory)")
@@ -155,7 +179,7 @@ class ContextInjector:
                     val_str = json.dumps(fact.value, ensure_ascii=False)
                     if len(val_str) > 160:
                         val_str = val_str[:157] + "..."
-                    fact_line = f"- ({fact.category}) {fact.key} = {val_str}"
+                    fact_line = f"- [{fact.memory_type}] ({fact.category}) {fact.key} = {val_str}"
                     if _fits_with([fact_line]):
                         lines.append(fact_line)
                         included_facts.append(fact)
@@ -172,7 +196,7 @@ class ContextInjector:
                     compact_task = " ".join(ep.task.split())[:100]
                     compact_art = " ".join(ep.final_artifact.split())[:220]
                     ep_line = (
-                        f"- [ep#{ep.id} score={ep.hybrid_score:.2f}] "
+                        f"- [ep#{ep.id} score={ep.hybrid_score:.2f} rrf={ep.rrf_score:.2f}] "
                         f"Task: {compact_task} => Artifact: {compact_art}"
                     )
                     if _fits_with([ep_line]):
@@ -186,7 +210,6 @@ class ContextInjector:
         formatted = "\n".join(lines)
         token_count = estimate_tokens(formatted, chars_per_tok)
 
-        # Final hard safety clamp in case header/footer alone approached small custom budget
         if token_count > effective_ceiling:
             max_chars = max(32, effective_ceiling * chars_per_tok - len(footer) - 8)
             formatted = formatted[:max_chars].rstrip() + "\n" + footer

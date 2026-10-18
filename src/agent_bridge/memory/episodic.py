@@ -1,8 +1,9 @@
-"""Semantic & Episodic Memory Layer (`episodic_artifacts` + SQLite FTS5 + CPU Vectors).
+"""Semantic & Episodic Memory Layer (`episodic_artifacts` + SQLite FTS5 + CPU Vectors + RRF).
 
 Stores only validated (Task, Final_Artifact) pairs scoped by `(repo_identifier, git_branch)`,
 discarding intermediate tool-calls and error traces. Provides sub-millisecond hybrid retrieval
-combining SQLite FTS5 BM25, CPU-embedded float32 vector cosine similarity, and recency decay.
+combining SQLite FTS5 BM25, CPU-embedded float32 vector cosine similarity, Reciprocal Rank Fusion
+(RRF, k=60), and temporal recency decay.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from agent_bridge.memory.engine import (
 )
 
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]{2,}")
+DEFAULT_RRF_K = 60
 
 
 class EpisodicArtifact(BaseModel):
@@ -37,7 +39,8 @@ class EpisodicArtifact(BaseModel):
     quality_score: float = Field(default=1.0, ge=0.0, le=1.0)
     pinned: bool = Field(default=False)
     created_at: str
-    hybrid_score: float = Field(default=0.0, description="Combined BM25 + Vector + Recency relevance score")
+    hybrid_score: float = Field(default=0.0, description="Combined RRF + BM25 + Vector + Recency relevance score")
+    rrf_score: float = Field(default=0.0, description="Normalized Reciprocal Rank Fusion (k=60) score in [0.0, 1.0]")
     bm25_score: float = Field(default=0.0)
     vector_score: float = Field(default=0.0)
     recency_decay: float = Field(default=1.0, description="Temporal decay multiplier in (0.0, 1.0]")
@@ -63,12 +66,10 @@ class CPUEmbedder:
         tokens = _TOKEN_RE.findall(cleaned)
         features: list[tuple[str, float]] = []
 
-        # Word unigrams (weight 1.0) and bigrams (weight 1.25)
         for i, tok in enumerate(tokens):
             features.append((f"w:{tok}", 1.0))
             if i + 1 < len(tokens):
                 features.append((f"b:{tok}_{tokens[i + 1]}", 1.25))
-            # Character 3-grams for sub-word / identifier similarity (weight 0.4)
             if len(tok) >= 4:
                 for j in range(len(tok) - 2):
                     features.append((f"c:{tok[j : j + 3]}", 0.4))
@@ -100,8 +101,35 @@ def compute_recency_decay(created_at_iso: str, half_life_days: float = 30.0) -> 
         return 1.0
 
 
+def compute_normalized_rrf(
+    bm25_rank: int | None,
+    vector_rank: int | None,
+    w_bm25: float = 0.6,
+    w_vec: float = 0.4,
+    rrf_k: int = DEFAULT_RRF_K,
+) -> float:
+    """Compute scale-invariant Reciprocal Rank Fusion score normalized to [0.0, 1.0].
+
+    Formula:
+        raw_rrf = (w_bm25 / (k + bm25_rank)) + (w_vec / (k + vector_rank))
+        max_rrf = (w_bm25 + w_vec) / (k + 1)
+    """
+    k = max(1, int(rrf_k))
+    max_possible = (w_bm25 + w_vec) / float(k + 1)
+    if max_possible <= 1e-12:
+        return 0.0
+
+    raw = 0.0
+    if bm25_rank is not None and bm25_rank >= 1:
+        raw += w_bm25 / float(k + bm25_rank)
+    if vector_rank is not None and vector_rank >= 1:
+        raw += w_vec / float(k + vector_rank)
+
+    return round(max(0.0, min(1.0, raw / max_possible)), 4)
+
+
 class EpisodicMemoryStore:
-    """Manages Git-scoped validated episodic artifacts with FTS5 BM25 + CPU vector hybrid search."""
+    """Manages Git-scoped validated episodic artifacts with FTS5 BM25 + CPU vector + RRF hybrid search."""
 
     _FORBIDDEN_ERROR_MARKERS = (
         "traceback (most recent call last):",
@@ -212,6 +240,7 @@ class EpisodicMemoryStore:
             pinned=pinned,
             created_at=now_iso,
             hybrid_score=1.0,
+            rrf_score=1.0,
             bm25_score=1.0,
             vector_score=1.0,
             recency_decay=1.0,
@@ -225,8 +254,9 @@ class EpisodicMemoryStore:
         vector_weight: float | None = None,
         git_branch: str | None = None,
         all_branches: bool = False,
+        rrf_k: int = DEFAULT_RRF_K,
     ) -> list[EpisodicArtifact]:
-        """Hybrid retrieval fusing SQLite FTS5 BM25, CPU vector cosine similarity, and Git branch scoping."""
+        """Hybrid retrieval fusing SQLite FTS5 BM25, CPU vector cosine similarity, and RRF (k=60)."""
         w_bm25 = self.engine.config.budget.bm25_weight if bm25_weight is None else bm25_weight
         w_vec = self.engine.config.budget.vector_weight if vector_weight is None else vector_weight
         target_repo = self.engine.git_context.repo_identifier
@@ -244,6 +274,8 @@ class EpisodicMemoryStore:
         fts_query = self._sanitize_fts5_query(query)
 
         bm25_by_id: dict[int, float] = {}
+        bm25_rank_by_id: dict[int, int] = {}
+
         with self.engine.connection() as conn:
             if fts_query:
                 fts_rows = conn.execute(
@@ -256,8 +288,10 @@ class EpisodicMemoryStore:
                     """,
                     (fts_query, max(top_k * 8, 40)),
                 ).fetchall()
-                for r in fts_rows:
-                    bm25_by_id[int(r["id"])] = max(0.0, float(r["raw_bm25"]))
+                for rank_idx, r in enumerate(fts_rows, start=1):
+                    rid = int(r["id"])
+                    bm25_by_id[rid] = max(0.0, float(r["raw_bm25"]))
+                    bm25_rank_by_id[rid] = rank_idx
 
             if visible_branches is None:
                 candidate_rows = conn.execute(
@@ -293,12 +327,18 @@ class EpisodicMemoryStore:
         if not candidate_rows:
             return []
 
-        # Compute max_bm25 only over visible candidate rows so scores normalize cleanly
         visible_ids = {int(r["id"]) for r in candidate_rows}
         max_bm25 = max((v for k, v in bm25_by_id.items() if k in visible_ids), default=0.0)
-        results: list[EpisodicArtifact] = []
 
-        for r in candidate_rows:
+        # Re-rank visible BM25 matches sequentially (1..M) within visible candidates
+        visible_bm25_sorted = sorted(
+            (rid for rid in visible_ids if rid in bm25_rank_by_id),
+            key=lambda rid: bm25_rank_by_id[rid],
+        )
+        norm_bm25_ranks = {rid: idx for idx, rid in enumerate(visible_bm25_sorted, start=1)}
+
+        results: list[EpisodicArtifact] = []
+        for vec_rank_idx, r in enumerate(candidate_rows, start=1):
             row_id = int(r["id"])
             raw_bm25 = bm25_by_id.get(row_id, 0.0)
             norm_bm25 = (raw_bm25 / max_bm25) if max_bm25 > 1e-9 else 0.0
@@ -310,8 +350,20 @@ class EpisodicMemoryStore:
             branch_boost = 1.0 if row_branch == active_branch else 0.92
             pin_boost = 1.05 if int(r["pinned"] or 0) == 1 else 1.0
 
-            base_relevance = (w_bm25 * norm_bm25) + (w_vec * vec_sim)
-            hybrid = base_relevance * (0.85 + 0.15 * quality) * recency * branch_boost * pin_boost
+            b_rank = norm_bm25_ranks.get(row_id)
+            v_rank = vec_rank_idx if vec_sim > 1e-6 else None
+            rrf_norm = compute_normalized_rrf(
+                bm25_rank=b_rank,
+                vector_rank=v_rank,
+                w_bm25=w_bm25,
+                w_vec=w_vec,
+                rrf_k=rrf_k,
+            )
+
+            linear_relevance = (w_bm25 * norm_bm25) + (w_vec * vec_sim)
+            # Fuse scale-free RRF rank score (35%) with calibrated linear magnitude (65%)
+            fused_relevance = (0.65 * linear_relevance) + (0.35 * rrf_norm)
+            hybrid = fused_relevance * (0.85 + 0.15 * quality) * recency * branch_boost * pin_boost
             hybrid = min(1.0, hybrid)
 
             results.append(
@@ -326,13 +378,14 @@ class EpisodicMemoryStore:
                     pinned=bool(int(r["pinned"] or 0)),
                     created_at=created_str,
                     hybrid_score=round(hybrid, 4),
+                    rrf_score=rrf_norm,
                     bm25_score=round(norm_bm25, 4),
                     vector_score=round(vec_sim, 4),
                     recency_decay=recency,
                 )
             )
 
-        results.sort(key=lambda item: (item.hybrid_score, item.id), reverse=True)
+        results.sort(key=lambda item: (item.hybrid_score, item.rrf_score, item.id), reverse=True)
         return results[:top_k]
 
     def list_recent(

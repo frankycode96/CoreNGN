@@ -24,7 +24,9 @@ from agent_bridge.memory.declarative import DeclarativeMemoryStore
 from agent_bridge.memory.engine import LocalMemoryEngine
 from agent_bridge.memory.episodic import EpisodicMemoryStore
 from agent_bridge.memory.injector import ContextInjector
+from agent_bridge.memory.journal import ReasoningJournalStore
 from agent_bridge.orchestrator.graph import HybridAgentBridgeRunner
+from agent_bridge.rlm.tools import RLMWorkspaceToolkit
 from agent_bridge.runtime.detector import RuntimeDetector
 from agent_bridge.ui.tui import AgentBridgeTUI, render_rich_dashboard_snapshot
 
@@ -85,7 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
         )
         tui_p.add_argument("--query", type=str, default="", help="Optional query to preview retrieval explanation")
 
-    # 5. Top-level curation shortcuts (`pin`, `unpin`, `forget`, `prune`, `explain`)
+    # 5. Top-level curation shortcuts (`pin`, `unpin`, `forget`, `prune`, `consolidate`, `explain`)
     pin_top = subparsers.add_parser("pin", help="Mark a declarative fact as immutable (protected from overwrites)")
     pin_top.add_argument("category", type=str)
     pin_top.add_argument("key", type=str)
@@ -103,7 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
     prune_top.add_argument("--min-score", type=float, default=0.5, help="Minimum salience quality score (default: 0.5)")
     prune_top.add_argument("--dry-run", action="store_true", help="Preview prunable IDs without deleting")
 
-    explain_top = subparsers.add_parser("explain", help="Explain BM25 + CPU Vector + Recency scoring and token budget")
+    cons_top = subparsers.add_parser(
+        "consolidate",
+        help="Deterministic semantic auto-consolidation of near-duplicate episodic artifacts (cosine >= threshold)",
+    )
+    cons_top.add_argument("--threshold", type=float, default=0.92, help="Cosine similarity threshold (default: 0.92)")
+    cons_top.add_argument("--dry-run", action="store_true", help="Preview redundant IDs without deleting")
+
+    explain_top = subparsers.add_parser(
+        "explain",
+        help="Explain BM25 + CPU Vector + RRF + Recency scoring and token budget",
+    )
     explain_top.add_argument("query", type=str, help="Task or search query to explain")
     explain_top.add_argument("--top-k", type=int, default=8)
 
@@ -122,6 +134,14 @@ def _build_parser() -> argparse.ArgumentParser:
     m_upsert.add_argument("key", type=str)
     m_upsert.add_argument("value", type=str)
     m_upsert.add_argument("--pin", action="store_true", help="Immediately pin fact as immutable")
+    m_upsert.add_argument(
+        "--type",
+        dest="memory_type",
+        choices=["FACT", "BELIEF", "PREFERENCE", "IDENTITY", "RULE", "EXPERIENCE"],
+        default=None,
+        help="Explicit 6-type semantic taxonomy (RULE auto-pins; BELIEF defaults to 30-day TTL)",
+    )
+    m_upsert.add_argument("--ttl-days", type=float, default=None, help="Optional TTL expiration in days")
 
     m_pin = mem_sub.add_parser("pin", help="Pin a declarative fact as immutable")
     m_pin.add_argument("category", type=str)
@@ -135,16 +155,43 @@ def _build_parser() -> argparse.ArgumentParser:
     m_forget.add_argument("target", type=str)
     m_forget.add_argument("--force", action="store_true")
 
-    m_prune = mem_sub.add_parser("prune", help="Prune old or low-salience memories")
+    m_prune = mem_sub.add_parser("prune", help="Prune old, low-salience, or expired BELIEF memories")
     m_prune.add_argument("--older-than", type=int, default=30)
     m_prune.add_argument("--min-score", type=float, default=0.5)
     m_prune.add_argument("--dry-run", action="store_true")
+
+    m_cons = mem_sub.add_parser("consolidate", help="Consolidate near-duplicate episodic artifacts")
+    m_cons.add_argument("--threshold", type=float, default=0.92)
+    m_cons.add_argument("--dry-run", action="store_true")
 
     m_explain = mem_sub.add_parser("explain", help="Explain hybrid retrieval scoring breakdown")
     m_explain.add_argument("query", type=str)
     m_explain.add_argument("--top-k", type=int, default=8)
 
-    # 7. `agentic benchmark` (Phase 7)
+    # 7. `agentic journal` (Thought Journal inspector)
+    journ_p = subparsers.add_parser("journal", help="Inspect structured Thought Journal checkpoints")
+    journ_p.add_argument("--thread-id", type=str, default=None, help="Filter by specific thread ID")
+    journ_p.add_argument("--limit", type=int, default=20, help="Maximum journal entries to return")
+
+    # 8. `agentic rlm` (RLM Surgical Workspace Inspector)
+    rlm_p = subparsers.add_parser("rlm", help="Surgical RLM workspace inspection (peek, search, chunk)")
+    rlm_sub = rlm_p.add_subparsers(dest="rlm_command", required=True)
+    rlm_peek = rlm_sub.add_parser("peek", help="Peek a line range of a workspace file")
+    rlm_peek.add_argument("path", type=str)
+    rlm_peek.add_argument("--start-line", type=int, default=1)
+    rlm_peek.add_argument("--end-line", type=int, default=40)
+
+    rlm_search = rlm_sub.add_parser("search", help="Regex search across workspace files")
+    rlm_search.add_argument("pattern", type=str)
+    rlm_search.add_argument("--path", type=str, default=None)
+    rlm_search.add_argument("--max-hits", type=int, default=12)
+
+    rlm_chunk = rlm_sub.add_parser("chunk", help="Read a bounded chunk of a large workspace file")
+    rlm_chunk.add_argument("path", type=str)
+    rlm_chunk.add_argument("--chunk-size", type=int, default=50)
+    rlm_chunk.add_argument("--chunk-index", type=int, default=0)
+
+    # 9. `agentic benchmark` (Phase 7)
     bench_p = subparsers.add_parser("benchmark", help="Run on-device latency, throughput, and RSS footprint benchmark")
     bench_p.add_argument("--iterations", type=int, default=100, help="Synthetic persistence iterations (default: 100)")
     bench_p.add_argument("--format", choices=["markdown", "json", "both"], default="both")
@@ -274,6 +321,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(res_p.model_dump(), indent=2))
         return 0
 
+    if sub_cmd == "consolidate":
+        res_c = curator.consolidate_duplicates(
+            similarity_threshold=args.threshold,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(res_c.model_dump(), indent=2))
+        return 0
+
     if sub_cmd == "explain":
         rep = curator.explain(args.query, top_k=args.top_k)
         print(json.dumps(rep.model_dump(), indent=2))
@@ -284,7 +339,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             parsed_value = json.loads(args.value)
         except json.JSONDecodeError:
             parsed_value = args.value
-        fact = decl.upsert_fact(args.category, args.key, parsed_value, pinned=True if args.pin else None)
+        fact = decl.upsert_fact(
+            args.category,
+            args.key,
+            parsed_value,
+            pinned=True if args.pin else None,
+            memory_type=args.memory_type,
+            ttl_days=args.ttl_days,
+        )
         print(json.dumps(fact.model_dump(), indent=2))
         return 0
 
@@ -307,6 +369,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         print(json.dumps(report, indent=2))
         return 0
+
+    if args.command == "journal":
+        journal_store = ReasoningJournalStore(engine)
+        if args.thread_id:
+            entries = journal_store.get_thread_journal(thread_id=args.thread_id, limit=args.limit)
+        else:
+            entries = journal_store.list_recent_thoughts(limit=args.limit)
+        print(
+            json.dumps(
+                {
+                    "count": len(entries),
+                    "entries": [e.model_dump() for e in entries],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "rlm":
+        rlm = RLMWorkspaceToolkit(repo_root=config.repo_root)
+        if args.rlm_command == "peek":
+            snippet = rlm.peek(args.path, start_line=args.start_line, end_line=args.end_line)
+            print(json.dumps(snippet.model_dump(), indent=2))
+            return 0
+        if args.rlm_command == "search":
+            hits = rlm.search(args.pattern, rel_path=args.path, max_matches=args.max_hits)
+            print(json.dumps({"hits": [h.model_dump() for h in hits]}, indent=2))
+            return 0
+        if args.rlm_command == "chunk":
+            chunks = rlm.chunk(args.path, chunk_lines=args.chunk_size)
+            selected = chunks[args.chunk_index] if 0 <= args.chunk_index < len(chunks) else None
+            print(
+                json.dumps(
+                    {
+                        "total_chunks": len(chunks),
+                        "chunk": selected.model_dump() if selected else None,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
 
     if args.command == "benchmark":
         from agent_bridge.benchmark.runner import BenchmarkRunner
