@@ -129,16 +129,29 @@ agentic benchmark --iterations 100 --format both
 
 ---
 
-## 🖥️ Interactive Terminal UI (TUI)
+## 🖥️ Interactive Terminal UI (TUI) & HTML5 Dashboard
 
-No heavy web dashboards. No React or Docker containers eating RAM your local LLM needs.
+CoreNGN rejects heavy Electron apps and bulky multi-container web stacks. It provides an ultra-fast full-screen terminal dashboard built on `textual` / `rich`, alongside a standalone HTML5 export:
 
-Launch the full-screen interactive dashboard with `agentic tui`:
-- 🧭 **Memory Explorer:** Browse, search, pin, or delete declarative facts and episodic solutions in real time.
-- 📈 **Live Execution Monitor:** Inspect LangGraph node transitions, Noul confidence values, and System-1 Gatekeeper scores.
-- 🪞 **Repo Truth Diff:** Compare what's cached in memory against live workspace files on disk to catch drift immediately.
+### 1. Zero-Bloat Terminal Dashboard (`agentic tui` / `agentic inspect`)
 
----
+<div align="center">
+  <img src="assets/tui-screenshot.svg" alt="CoreNGN Terminal UI Screenshot" width="100%" />
+</div>
+
+- 🧭 **Memory Explorer (Tabs 1A & 1B):** Live browsing and hotkey curation (`pin`, `unpin`, `forget`) across Declarative Rules and Episodic Solutions.
+- 🔬 **RRF & Token Budget Explainability:** Transparent score breakdown explaining exactly why an item won the `< 800` token context injection.
+- 🪞 **Repo Truth Diff (Tab 3):** Real-time diff inspector comparing in-memory state against live files on disk to catch drift immediately.
+
+### 2. Standalone HTML5 Dashboard (`assets/dashboard.html`)
+
+For teams sharing state reports or running on headless CI machines, CoreNGN exports a zero-dependency HTML5 dashboard:
+
+<div align="center">
+  <img src="assets/html5-dashboard-preview.svg" alt="CoreNGN HTML5 Dashboard Preview" width="100%" />
+</div>
+
+> Open `assets/dashboard.html` in any browser to inspect telemetry, budget usage, and declarative facts with zero server processes.
 
 ## 🤝 Working with OMP & Local Runtimes
 

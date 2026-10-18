@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CoreNGN &mdash; Zero-Bloat Memory & Execution Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --purple: #bc8cff;
+      --yellow: #d29922;
+      --orange: #f0883e;
+      --font-mono: 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, #58a6ff, #bc8cff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      font-family: var(--font-mono);
+      background: rgba(88, 166, 255, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(88, 166, 255, 0.3);
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .stat-title {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .stat-val {
+      font-size: 22px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 14px 20px;
+      background: rgba(255, 255, 255, 0.02);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      text-align: left;
+    }
+    th {
+      background: rgba(0, 0, 0, 0.2);
+      color: var(--text-muted);
+      font-weight: 600;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    td {
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+    .mono { font-family: var(--font-mono); }
+    .tag {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      font-weight: 600;
+    }
+    .tag-rule { background: rgba(188, 140, 255, 0.2); color: var(--purple); border: 1px solid rgba(188, 140, 255, 0.4); }
+    .tag-pin { background: rgba(210, 153, 34, 0.2); color: var(--yellow); border: 1px solid rgba(210, 153, 34, 0.4); }
+    .tag-branch { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+    .tag-score { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+    .code-preview {
+      background: #090d13;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #7ee787;
+      max-width: 650px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .budget-bar-wrap {
+      background: #21262d;
+      border-radius: 10px;
+      height: 8px;
+      width: 140px;
+      overflow: hidden;
+      margin-top: 6px;
+    }
+    .budget-bar-fill {
+      background: linear-gradient(90deg, #3fb950, #d29922);
+      height: 100%;
+      width: 35%;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="brand">
+        <div class="logo">⚡ CoreNGN Dashboard</div>
+        <span class="badge">SQLite WAL v3 &bull; Zero VRAM (0.0 MB)</span>
+      </div>
+      <div class="badge" style="border-color: #3fb950; color: #3fb950;">
+        Branch: <span style="color:#fff;">main</span> | Repo: <span style="color:#fff;">git:ai-memory:06d16dd7</span>
+      </div>
+    </header>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-title">Declarative Rules & Facts</div>
+        <div class="stat-val" style="color: var(--purple);">3 <span style="font-size: 13px; color: var(--text-muted);">(2 pinned)</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-title">Episodic Solutions (FTS5 + Vector)</div>
+        <div class="stat-val" style="color: var(--green);">2</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-title">Context Budget Used</div>
+        <div class="stat-val" style="color: var(--accent);">278 / 799 <span style="font-size: 12px;">tok</span></div>
+        <div class="budget-bar-wrap"><div class="budget-bar-fill"></div></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-title">System-1 Latency & Safety</div>
+        <div class="stat-val" style="color: #79c0ff;">&lt; 1.5ms <span style="font-size: 13px; color: var(--green);">5-Layer AST OK</span></div>
+      </div>
+    </div>
+
+    <!-- Declarative Memory Table -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">📌 Declarative Architecture Rules & Facts</div>
+        <span class="tag tag-pin">Latest Write = Ground Truth</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 60px;">ID</th>
+            <th style="width: 110px;">Type</th>
+            <th style="width: 140px;">Category</th>
+            <th style="width: 220px;">Key</th>
+            <th>Value (Pinned Immutable)</th>
+            <th style="width: 90px;">Branch</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td class="mono">#3</td>
+            <td><span class="tag tag-rule">RULE</span> <span class="tag tag-pin">PIN</span></td>
+            <td class="mono" style="color: var(--accent);">coding_conventions</td>
+            <td class="mono" style="font-weight: 600;">naming_convention</td>
+            <td><div class="code-preview" style="color: #e6edf3;">PEP8 strict snake_case and typed signatures</div></td>
+            <td><span class="tag tag-branch">main</span></td>
+          </tr>
+
+          <tr>
+            <td class="mono">#2</td>
+            <td><span class="tag tag-rule">RULE</span> <span class="tag tag-pin">PIN</span></td>
+            <td class="mono" style="color: var(--accent);">architecture</td>
+            <td class="mono" style="font-weight: 600;">persistence_spec</td>
+            <td><div class="code-preview" style="color: #e6edf3;">Zero-Container SQLite WAL with sqlite-vec and 800 token budget</div></td>
+            <td><span class="tag tag-branch">main</span></td>
+          </tr>
+
+          <tr>
+            <td class="mono">#1</td>
+            <td><span class="tag tag-rule">FACT</span> </td>
+            <td class="mono" style="color: var(--accent);">runtime</td>
+            <td class="mono" style="font-weight: 600;">model</td>
+            <td><div class="code-preview" style="color: #e6edf3;">llama-3.1-8b-instruct</div></td>
+            <td><span class="tag tag-branch">main</span></td>
+          </tr>
+
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Episodic Retrieval & Explainability Table -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">🧠 Episodic Retrieval & Reciprocal Rank Fusion (RRF k=60)</div>
+        <span class="tag tag-score">Explain Query: calculate_sha256_checksum</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 60px;">Rank</th>
+            <th style="width: 110px;">Tier</th>
+            <th style="width: 220px;">Identifier / Key</th>
+            <th style="width: 100px;">Hybrid Score</th>
+            <th style="width: 90px;">Token Cost</th>
+            <th>Budget Allocation & Justification</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td class="mono" style="font-weight: 700;">#1</td>
+            <td><span class="tag tag-rule">Declarative</span></td>
+            <td class="mono">coding_conventions:naming_convention</td>
+            <td class="mono" style="color: var(--green); font-weight: 700;">1.000</td>
+            <td class="mono">24 tok</td>
+            <td style="color: var(--text-muted); font-size: 12px;">INCLUDED: Declarative RULE (pinned immutable, branch=main, cost=24 tok).</td>
+          </tr>
+
+          <tr>
+            <td class="mono" style="font-weight: 700;">#2</td>
+            <td><span class="tag tag-rule">Declarative</span></td>
+            <td class="mono">architecture:persistence_spec</td>
+            <td class="mono" style="color: var(--green); font-weight: 700;">1.000</td>
+            <td class="mono">27 tok</td>
+            <td style="color: var(--text-muted); font-size: 12px;">INCLUDED: Declarative RULE (pinned immutable, branch=main, cost=27 tok).</td>
+          </tr>
+
+          <tr>
+            <td class="mono" style="font-weight: 700;">#3</td>
+            <td><span class="tag tag-rule">Declarative</span></td>
+            <td class="mono">runtime:model</td>
+            <td class="mono" style="color: var(--green); font-weight: 700;">0.850</td>
+            <td class="mono">13 tok</td>
+            <td style="color: var(--text-muted); font-size: 12px;">INCLUDED: Declarative FACT (mutable, branch=main, cost=13 tok).</td>
+          </tr>
+
+          <tr>
+            <td class="mono" style="font-weight: 700;">#4</td>
+            <td><span class="tag tag-score">Episodic</span></td>
+            <td class="mono">ep#2</td>
+            <td class="mono" style="color: var(--green); font-weight: 700;">0.591</td>
+            <td class="mono">91 tok</td>
+            <td style="color: var(--text-muted); font-size: 12px;">INCLUDED: Hybrid=0.5908 [RRF=0.600, BM25=1.00*0.6 (0.600) + VecCos=0.00*0.4 (0.000)] * Recency=1.00 * Branch(main)=1.00, cost=91 tok.</td>
+          </tr>
+
+          <tr>
+            <td class="mono" style="font-weight: 700;">#5</td>
+            <td><span class="tag tag-score">Episodic</span></td>
+            <td class="mono">ep#1</td>
+            <td class="mono" style="color: var(--green); font-weight: 700;">0.148</td>
+            <td class="mono">93 tok</td>
+            <td style="color: var(--text-muted); font-size: 12px;">INCLUDED: Hybrid=0.1478 [RRF=0.400, BM25=0.00*0.6 (0.000) + VecCos=0.04*0.4 (0.017)] * Recency=0.99 * Branch(main)=1.00, cost=93 tok.</td>
+          </tr>
+
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Repo Truth Diff Table -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">🪞 Workspace & Repo Truth Inspector (Disk > Memory)</div>
+        <span class="tag tag-score">Live Disk Primacy</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 200px;">File Path</th>
+            <th style="width: 140px;">Verification Status</th>
+            <th style="width: 100px;">Branch</th>
+            <th>In-Memory vs Live Disk Diff Preview</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <tr>
+            <td class="mono" style="font-weight: 600; color: var(--accent);">pyproject.toml</td>
+            <td><span class="tag tag-score">DISK_VERIFIED</span></td>
+            <td><span class="tag tag-branch">main</span></td>
+            <td><div class="code-preview">+++ disk://pyproject.toml
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[project]
+n</div></td>
+          </tr>
+
+          <tr>
+            <td class="mono" style="font-weight: 600; color: var(--accent);">README.md</td>
+            <td><span class="tag tag-score">DISK_VERIFIED</span></td>
+            <td><span class="tag tag-branch">main</span></td>
+            <td><div class="code-preview">+++ disk://README.md
+<div align="center">
+
+# ⚡ CoreNGN
+### *Zero-Bloat, Local-First Agent Memory & Dual-Core LangGraph O</div></td>
+          </tr>
+
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
