@@ -1,4 +1,4 @@
-# Hybrid Agent Bridge (`hybrid-agent-bridge`)
+# CoreNGN (hybrid-memory-engine)
 
 **Zero-Container Local-First 4-Tier Memory & System-1 / System-2 Hierarchical LangGraph Orchestration Framework.**
 
