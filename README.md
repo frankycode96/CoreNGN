@@ -8,33 +8,38 @@ Designed for real-time reliability on consumer/prosumer hardware running local q
 
 ## Architectural Pillars
 
-1. **Zero-Container Local-First Persistence (`LocalMemoryEngine`)**
-   - Unifies all 4 memory tiers into a single embedded SQLite file (`~/.agent_bridge/memory.db`) running in **WAL (Write-Ahead Logging)** mode (`synchronous=NORMAL`, `busy_timeout=5000ms`).
-   - **Git-Branch Scoped Persistence**: Automatically resolves the active Git repository and branch (`git rev-parse --abbrev-ref HEAD`), isolating unmerged feature-branch memories so they never pollute `main`/`master`.
+1. **Zero-Container Local-First Persistence (`LocalMemoryEngine` - SQLite v3)**
+   - Unifies all memory tiers and audit trails into a single embedded SQLite file (`~/.agent_bridge/memory.db`) in **WAL** mode (`synchronous=NORMAL`, `busy_timeout=5000ms`).
+   - **Git-Branch Scoped Persistence**: Automatically resolves active Git repository and branch (`git rev-parse --abbrev-ref HEAD`), isolating unmerged feature branches.
    - **Working Memory**: Atomic graph checkpoints via LangGraph's `SqliteSaver`.
-   - **Declarative Memory**: `declarative_facts` scoped by `(repo_identifier, git_branch, category, key)` with deterministic **Upsert** semantics (*latest write is ground truth*) and immutability pinning (`pinned=1`).
-   - **Semantic & Episodic Memory**: `episodic_artifacts` indexed via **SQLite FTS5 (BM25)** external-content triggers and CPU-embedded `float32` vectors (`sqlite-vec` + deterministic SQLite cosine similarity UDF). Stores **only** validated `(Task, Final_Artifact)` pairs.
-   - **Bounded Context Injector**: Guarantees a hard context budget (`< 800 tokens`) and enforces **Repo Truth Hierarchy > Declarative Memory > Episodic Memory**.
+   - **Declarative Memory (6-Type Taxonomy & TTL)**: Supports `FACT`, `BELIEF` (auto 30-day TTL expiration), `PREFERENCE`, `IDENTITY`, `RULE` (auto-pinned as immutable), and `EXPERIENCE`. Every mutation is tracked deterministically in `memory_audit_log`.
+   - **Episodic Memory (FTS5 + CPU Vector + RRF $k=60$)**: Hybrid ranking combining BM25 lexical search and CPU `float32` cosine similarity via Reciprocal Rank Fusion ($k=60$). Stores only validated `(Task, Final_Artifact)` pairs.
+   - **Bounded Context Injector**: Guarantees a hard context budget (`< 800 tokens`) enforcing **Repo Truth Hierarchy > Declarative Memory > Episodic Memory**.
+   - **Thought Journal (`ReasoningJournalStore`)**: Decoupled `reasoning_journal` tracking macro-FSM reasoning checkpoints and System-1 Noul confidence per `thread_id` without polluting episodic memory.
 
-2. **System-1 / System-2 Dualism (`JevDecisionAdapter`)**
+2. **System-1 / System-2 Dualism & 5-Layer Security Sandbox**
    - Generative LLMs (*System 2*) are reserved **exclusively** for artifact synthesis.
-   - Routing, memory ingestion classification, compliance validation, and sub-worker stopping conditions are delegated to a typed *System 1* controller implementing:
+   - *System 1* heuristic controller (`LocalHeuristicDecisionEngine`) evaluates syntax, AST integrity, anti-placeholders, and security gating in sub-millisecond cycles:
      - `Choice(state, question, options)` $\rightarrow$ chosen option + normalized Softmax distribution.
-     - `Score(state, question, scale_rubric)` $\rightarrow$ normalized scalar in $[0.0, 1.0]$ with AST & anti-placeholder rubric breakdown.
+     - `Score(state, question, scale_rubric)` $\rightarrow$ normalized scalar in $[0.0, 1.0]$.
      - `Noul(state, proposition)` $\rightarrow$ epistemic truth probability in $[0.0, 1.0]$.
+   - **5-Layer Security Sandbox (`CodeSandboxValidator`)**:
+     - *Layer 1 (Static AST)*: Blocks `eval`, `exec`, `compile`, `__import__`, `os.system`, `shutil.rmtree`.
+     - *Layer 2 (Import Blocklist)*: Blocks `ctypes`, `pickle`, `marshal`, `pty`, `fcntl`.
+     - *Layer 3 (`SafeEnv`)*: Strips sensitive credentials (`*KEY*`, `*TOKEN*`, `*SECRET*`).
+     - *Layer 4 (SSRF Guard)*: Blocks cloud metadata IPs (`169.254.169.254`) and dangerous URI schemes.
+     - *Layer 5 (Resource Cap)*: Enforces 100 KB max output limit and execution timeouts.
 
-3. **Deterministic Sub-Worker Isolation (`IsolatedSubWorker`)**
-   - Encapsulates exploratory multi-turn synthesis inside `SubWorker_Node` with:
-     - Zero shared state with the parent orchestrator.
-     - Strict round cap (`max_round <= 3`).
-     - Mandatory `120s` wall-clock timeout inside an isolated `asyncio` event loop.
-     - Immediate destruction of the internal scratchpad (`scratchpad.clear()`) before returning only the converging artifact.
+3. **Deterministic Sub-Worker Isolation & RLM Repo Truth Inspector**
+   - Encapsulates exploratory multi-turn synthesis inside `SubWorker_Node` with zero shared state, strict round cap (`max_round <= 3`), 120s timeout, and immediate scratchpad eviction (`scratchpad.clear()`).
+   - **RLM Workspace Toolkit (`RLMWorkspaceToolkit`)**: Surgical code inspection tools (`peek`, `search`, `chunk`, session scratchpad) to ground prompts directly in the filesystem under the `< 800 token` budget.
 
-4. **Anti-Memory-Rot Curation, Zero-Bloat TUI & On-Device Benchmark**
-   - **Memory Curation (`MemoryCurator`)**: `pin`, `unpin`, `forget`, `prune` (with `--dry-run`), and `explain` (transparent BM25 + CPU Vector + Recency + Branch score decomposition).
-   - **Zero-Bloat Terminal UI (`AgentBridgeTUI`)**: Full-screen `textual` and `rich` terminal dashboard with 3 tabs (*Memory Explorer*, *Live Graph Tracer*, and *Workspace & Repo Truth Diff*).
-   - **Universal Runtime Auto-Discovery (`RuntimeDetector`)**: Non-blocking probing of Ollama (`11434`), llama.cpp (`8080`), and vLLM/LM Studio (`1234`).
-   - **On-Device Benchmark (`BenchmarkRunner`)**: Profiles System-1 vs System-2 latency, TTFT, tokens/sec, and RSS RAM / SQLite disk growth over 100 synthetic runs with 0.0 MB VRAM overhead.
+4. **Anti-Memory-Rot Curation, Semantic Auto-Consolidation & TUI**
+   - **Semantic Auto-Consolidation**: Merges near-duplicate episodic artifacts (`cosine >= 0.92`) retaining the highest-quality artifact and unifying tags.
+   - **Memory Curation (`MemoryCurator`)**: `pin`, `unpin`, `forget`, `prune` (with expired-BELIEF TTL cleanup and `--dry-run`), and `explain` (BM25 + Vector + RRF score decomposition).
+   - **Zero-Bloat Terminal UI (`AgentBridgeTUI`)**: Full-screen `textual` and `rich` terminal dashboard (*Memory Explorer*, *Live Graph Tracer*, *Workspace & Repo Truth Diff*).
+   - **Universal Runtime Auto-Discovery (`RuntimeDetector`)**: Non-blocking discovery of Ollama, llama.cpp, and vLLM/LM Studio.
+   - **On-Device Benchmark (`BenchmarkRunner`)**: Profiles latency, TTFT, throughput, and RSS RAM / disk growth over 100 synthetic iterations.
 
 ---
 
@@ -42,10 +47,10 @@ Designed for real-time reliability on consumer/prosumer hardware running local q
 
 ```mermaid
 flowchart LR
-    START((START)) --> CL["1. Context_Loader<br/>(Repo Truth + <800 tok)"]
+    START((START)) --> CL["1. Context_Loader<br/>(Repo Truth + RLM + <800 tok)"]
     CL --> SW["2. SubWorker_Node<br/>(<=3 rounds, 120s timeout)"]
-    SW --> GK{"3. System1_Gatekeeper<br/>(Score & Noul)"}
-    GK -- "accept" --> EC["4. Episodic_Consolidator<br/>(SQLite FTS5 + Vector)"]
+    SW --> GK{"3. System1_Gatekeeper<br/>(5-Layer AST Sandbox + Noul)"}
+    GK -- "accept" --> EC["4. Episodic_Consolidator<br/>(RRF k=60 + Auto-Consolidate >=0.92)"]
     GK -- "retry (<= max_retries)" --> SW
     GK -- "abort" --> END((END))
     EC --> END
@@ -70,28 +75,36 @@ agentic init --seed-defaults
 agentic doctor
 ```
 
-### 3. Memory Curation, Retrieval Explanation & Execution
+### 3. Memory Curation, RLM Tools & Execution
 
 ```bash
-# Upsert and pin an immutable architectural constraint on the active Git branch
-agentic memory upsert runtime inference_backend "ollama/qwen2.5-coder:7b" --pin
-agentic pin architecture context_budget_tokens
+# Upsert declarative fact with 6-type taxonomy & TTL
+agentic memory upsert runtime inference_backend "ollama/qwen2.5-coder:7b" --type RULE
+agentic memory upsert hypothesis active_port "8080" --type BELIEF --ttl-days 30
+
+# Consolidate near-duplicate episodic memories (cosine >= 0.92)
+agentic consolidate --threshold 0.92
+
+# Surgical RLM inspection of codebase files
+agentic rlm peek src/agent_bridge/memory/episodic.py --start-line 104 --end-line 129
+agentic rlm search "compute_normalized_rrf"
+
+# Inspect structured Thought Journal checkpoints
+agentic journal --limit 10
 
 # Execute the 4-node LangGraph FSM
-agentic run "Write a Python function calculate_token_budget that estimates token usage" \
-  --fact "constraints:max_tokens=800"
+agentic run "Write a Python function calculate_token_budget that estimates token usage"
 
-# Explain exact BM25 + CPU Vector + Recency scoring and < 800 token budget decisions
+# Explain exact BM25 + CPU Vector + RRF scoring
 agentic explain "calculate_token_budget"
 
-# Prune outdated or low-salience memories (protecting pinned rules)
+# Prune outdated or low-salience memories and expired BELIEF facts
 agentic prune --older-than 30 --min-score 0.50 --dry-run
 
-# Launch the Zero-Bloat Terminal UI (or render a Rich snapshot)
+# Launch the Zero-Bloat Terminal UI
 agentic tui
-agentic tui --snapshot --query "calculate_token_budget"
 
-# Execute the 100-run on-device latency & footprint benchmark
+# Execute the 100-run on-device benchmark
 agentic benchmark --iterations 100 --format both
 ```
 
