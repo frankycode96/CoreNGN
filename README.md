@@ -100,3 +100,48 @@ agentic benchmark --iterations 100 --format both
 ```bash
 pytest -v
 ```
+
+## Core Capabilities & Architectural Advantages
+
+### 1. Deterministic Auto-Repair & Sandboxed Sub-Workers
+* **Isolated Multi-Agent Sandbox:** Encapsulates exploratory multi-agent collaboration (such as Coder and Critic workflows) within isolated sub-worker nodes[cite: 1, 2].
+* **Execution Guardrails & Circuit Breakers:** Restricts conversational loops with strict turn limits (`max_round`) and execution timeouts to eliminate token explosion and prevent orchestrator blocking[cite: 1, 2].
+* **Clean State Hand-Off:** Ensures the sub-worker extracts and returns only the final converged, validated artifact to the primary state machine[cite: 1, 2].
+* **Immediate Scratchpad Eviction:** Completely flushes and discards the internal conversational buffer upon node completion, preventing intermediate noise from causing context stuffing[cite: 1, 2].
+
+### 2. Multi-Tier Memory Persistence & Zero Semantic Drift
+* **Decoupled 4-Tier Memory:** Organizes state across Working, Declarative, Semantic, and Episodic persistence layers to eliminate monolithic prompt bloating[cite: 1, 3].
+* **Clean Episodic Storage:** Persists exclusively converged problem-solution pairs while aggressively pruning intermediate trial-and-error traces and failed attempts[cite: 1, 3].
+* **Mitigation of the "Telephone Game":** Prevents recursive summarization loss and semantic drift by avoiding continuous lossy compression of active chat dialogues[cite: 3].
+* **Ingestion Garbage Collection:** Automatically strips raw tool invocations, syntax errors, and internal reasoning traces before records reach long-term storage[cite: 1, 3, 5].
+
+### 3. Absolute Truth Hierarchy (`Repo State > Memory`)
+* **Background Context Demotion:** Treats retrieved memories strictly as background context rather than rigid, overriding instructions[cite: 1, 5].
+* **Disk Primacy:** Enforces that the live state of code files on disk within the repository always takes precedence over historical memory whenever conflicts arise[cite: 1, 5].
+* **Hallucination Suppression:** Eliminates phantom memories and outdated architectural assumptions when codebase implementations evolve across sessions[cite: 1, 5].
+
+### 4. Sub-Millisecond System-1 Decision Controller
+* **Deterministic Pre-Flight Checks:** Executes syntax validation via AST parsing and typed heuristic evaluations before dispatching generative LLM queries.
+* **Instantaneous Gating:** Resolves state routing and stopping criteria in sub-millisecond cycles on CPU, delivering significant speedups over generative round-trips.
+* **GPU Compute Reservation:** Leaves GPU cores and VRAM unburdened by routine classification tasks, reserving compute strictly for generative code synthesis.
+
+### 5. Resource Efficiency & Zero-VRAM Footprint
+* **Zero-VRAM Persistence:** Runs persistence operations, lexical search (BM25), and CPU embeddings entirely in-process without allocating GPU VRAM[cite: 1].
+* **KV-Cache Optimization:** Enforces strict context budget ceilings (< 800 tokens), preventing context window saturation and attention degradation[cite: 1, 3].
+* **Container-Free Deployment:** Eliminates mandatory external server stacks (e.g., PostgreSQL, Redis, standalone vector DBs) in local-first environments in favor of embedded storage[cite: 1].
+
+### 6. Git-Awareness & Branch-Scoped Isolation
+* **Branch-Context Tracking:** Automatically associates declarative rules and episodic solutions with the active Git branch and repository identifier.
+* **Cross-Branch Quarantine:** Isolates unmerged feature-branch memories from contaminating the main trunk branch.
+* **Asymmetric Inheritance:** Permits experimental feature branches to inherit baseline trunk conventions while preventing unverified assumptions from polluting global state.
+
+### 7. Explicit Memory Curation & Human-in-the-Loop Control
+* **Native Checkpointing & Time Travel:** Leverages state checkpointing to allow pausing execution, inspecting states, and rolling back steps retroactively[cite: 1, 2, 3].
+* **Immutable Pinning:** Allows developers to pin critical architectural rules to guarantee they cannot be overwritten by automatic compaction or LLM updates[cite: 1].
+* **Deterministic Deletion:** Provides explicit deletion mechanisms to atomically purge obsolete memories across relational and search indices[cite: 1, 5].
+* **Retrieval Explainability:** Exposes exact score breakdowns detailing lexical BM25 matching, vector cosine similarity, and recency decay contributions.
+
+### 8. Flexible Deployment & OMP Ecosystem Interoperability
+* **Standalone Local Operation:** Runs self-contained on a single developer machine with zero network dependencies[cite: 1].
+* **Asymmetric Exobrain Setup:** Operates as a centralized memory daemon serving remote execution environments and coding agents over lightweight HTTP APIs[cite: 1, 5].
+* **OMP (Oh My Pi) Integration:** Integrates with terminal workflows by mirroring OMP native memory principles (`mnemopi`, `local`, and `hindsight`)[cite: 1, 5].
